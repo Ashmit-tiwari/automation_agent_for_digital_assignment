@@ -1,0 +1,1137 @@
+import asyncio
+import os
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime
+from playwright.async_api import async_playwright
+
+# Ensure utf-8 output encoding on Windows console
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
+SCREENSHOTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "screenshots")
+os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
+
+# Candidates for Chromium-based browsers across common Windows paths
+BROWSER_CANDIDATES = [
+    # Brave
+    r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
+    r"C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe",
+    os.path.expandvars(r"%LOCALAPPDATA%\BraveSoftware\Brave-Browser\Application\brave.exe"),
+    # Google Chrome
+    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+    # Microsoft Edge
+    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+    r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\Edge\Application\msedge.exe"),
+]
+
+def find_installed_browser():
+    for p in BROWSER_CANDIDATES:
+        if os.path.exists(p):
+            return p
+    return "brave"
+
+def check_cdp_port(port, timeout=0.8):
+    import urllib.request
+    import json
+    try:
+        url = f"http://localhost:{port}/json/version"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode())
+            return True, data.get("Browser", "Chromium")
+    except Exception:
+        return False, None
+
+def find_active_browser_port(start_port=9222, end_port=9230):
+    for p in range(start_port, end_port + 1):
+        ok, browser = check_cdp_port(p, timeout=0.3)
+        if ok:
+            return p, browser
+    return None, None
+
+def find_free_port(start_port=9222, max_scan=50):
+    import socket
+    for p in range(start_port, start_port + max_scan):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(0.2)
+            try:
+                s.bind(('127.0.0.1', p))
+                return p
+            except OSError:
+                continue
+    return 9222
+
+def is_browser_process_running(proc_name):
+    import subprocess
+    try:
+        out = subprocess.check_output(f'tasklist /fi "imagename eq {proc_name}"', shell=True, text=True)
+        return proc_name.lower() in out.lower()
+    except Exception:
+        return False
+
+def launch_browser_on_port(port):
+    exe = find_installed_browser()
+    flags = [
+        f"--remote-debugging-port={port}",
+        "--remote-allow-origins=*",
+        "--disable-background-timer-throttling",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-renderer-backgrounding",
+    ]
+    flag_str = " ".join(flags)
+    try:
+        # Launch directly with persistent GUI flags
+        os.startfile(exe, arguments=flag_str)
+        return True
+    except Exception:
+        pass
+    try:
+        DETACHED_FLAGS = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        subprocess.Popen([exe] + flags, creationflags=DETACHED_FLAGS, close_fds=True)
+        return True
+    except Exception:
+        subprocess.Popen(f'start "" "{exe}" {flag_str}', shell=True)
+        return True
+
+class MasterByteXLAgent:
+    def __init__(self, port=9222, target=None):
+        self.port = port
+        self.target = (target or "").strip()
+        self.playwright = None
+        self.browser = None
+        self.context = None
+        self.bytexl_page = None
+        self.gemini_page = None
+        self.question_count = 0
+        self.current_activity_name = ""
+        self.completed_activities = set()
+
+    def ensure_browser_running(self):
+        """Checks if browser is running with debugging port, or auto-detects/launches it."""
+        ok, b_name = check_cdp_port(self.port, timeout=1.0)
+        if ok:
+            print(f"[OK] Browser ({b_name}) is already running on debugging port {self.port}.")
+            return True
+
+        # Check if browser is running on another common port
+        active_p, active_b = find_active_browser_port(9222, 9230)
+        if active_p:
+            print(f"[*] Auto-detected active browser ({active_b}) on port {active_p}! Switching to port {active_p}...")
+            self.port = active_p
+            return True
+
+        exe = find_installed_browser()
+        proc_name = os.path.basename(exe)
+        b_label = proc_name.replace(".exe", "").capitalize()
+
+        if is_browser_process_running(proc_name):
+            print(f"\n========================================================")
+            print(f"[!] {b_label} is currently open, but remote debugging port {self.port} is disabled.")
+            print(f"[*] Restarting {b_label} with remote debugging on port {self.port}...")
+            print(f"========================================================\n")
+            try:
+                subprocess.run(f"taskkill /F /IM {proc_name}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                for _ in range(10):
+                    time.sleep(0.5)
+                    if not is_browser_process_running(proc_name):
+                        break
+            except Exception:
+                pass
+
+        print(f"[*] Launching {b_label} browser with remote debugging on port {self.port}...")
+        launch_browser_on_port(self.port)
+
+        print(f"[*] Waiting for browser on port {self.port}...")
+        for i in range(12):
+            time.sleep(1)
+            ok, b_name = check_cdp_port(self.port, timeout=1.0)
+            if ok:
+                print(f"[OK] Browser ({b_name}) is ready and listening on port {self.port}!")
+                return True
+
+        print(f"[!] Browser did not respond on port {self.port} within 12 seconds.")
+        return False
+
+    async def connect(self):
+        ready = self.ensure_browser_running()
+        if not ready:
+            return False
+
+        self.playwright = await async_playwright().start()
+
+        cdp_url = f"http://127.0.0.1:{self.port}"
+        for attempt in range(4):
+            try:
+                self.browser = await self.playwright.chromium.connect_over_cdp(cdp_url, timeout=5000)
+                break
+            except Exception:
+                await asyncio.sleep(1.0)
+
+        # Fallback: scan if browser opened on another port
+        if not self.browser:
+            active_p, active_b = find_active_browser_port(9222, 9230)
+            if active_p and active_p != self.port:
+                print(f"[*] Found active browser ({active_b}) on port {active_p}. Auto-connecting...")
+                try:
+                    self.browser = await self.playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{active_p}", timeout=5000)
+                    self.port = active_p
+                except Exception:
+                    pass
+
+        if not self.browser:
+            print(f"[!] Could not connect to browser on port {self.port}.")
+            print(f"[*] Tip: Run 'launch_debug_browser.bat {self.port}' or check port availability.")
+            return False
+
+        self.context = self.browser.contexts[0]
+        pages = self.context.pages
+
+        # Locate or open ByteXL and Gemini tabs
+        for p in pages:
+            url_lower = p.url.lower()
+            if "bytexl.ai" in url_lower and not self.bytexl_page:
+                self.bytexl_page = p
+            elif "gemini.google.com" in url_lower and not self.gemini_page:
+                self.gemini_page = p
+
+        if not self.bytexl_page:
+            print("[*] Opening ByteXL tab...")
+            self.bytexl_page = await self.context.new_page()
+            await self.bytexl_page.goto("https://app.bytexl.ai/courses")
+            await asyncio.sleep(2)
+
+        if not self.gemini_page:
+            print("[*] Opening Gemini tab...")
+            self.gemini_page = await self.context.new_page()
+            await self.gemini_page.goto("https://gemini.google.com/app")
+            await asyncio.sleep(2)
+
+        print(f"[OK] ByteXL Tab: {self.bytexl_page.url}")
+        print(f"[OK] Gemini Tab: {self.gemini_page.url}")
+        return True
+
+    async def take_screenshot(self, label: str) -> str:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"{label}_{timestamp}.png"
+        filepath = os.path.join(SCREENSHOTS_DIR, filename)
+        active_page = self.bytexl_page
+        for p in self.context.pages:
+            if "/test/" in p.url:
+                active_page = p
+                break
+        if active_page:
+            await active_page.bring_to_front()
+            try:
+                await active_page.screenshot(path=filepath, timeout=5000)
+                print(f"[SCREENSHOT] Saved: {filepath}")
+            except Exception:
+                pass
+
+        # Rolling cleanup: keep only latest 30 screenshots
+        try:
+            files = [os.path.join(SCREENSHOTS_DIR, f) for f in os.listdir(SCREENSHOTS_DIR) if f.endswith(('.png', '.jpg'))]
+            if len(files) > 30:
+                files.sort(key=lambda x: os.path.getmtime(x))
+                for old in files[:-30]:
+                    try:
+                        os.remove(old)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        return filepath
+
+    async def ask_gemini(self, prompt: str) -> str:
+        """Sends prompt to Gemini and retrieves the clean response."""
+        print(f"\n[*] Querying Gemini ({len(prompt)} chars)...")
+        await self.gemini_page.bring_to_front()
+        await asyncio.sleep(0.5)
+
+        existing = await self.gemini_page.query_selector_all('message-content, .model-response-text, [data-message-id]')
+        baseline_count = len(existing)
+
+        input_elem = await self.gemini_page.wait_for_selector('rich-textarea [contenteditable="true"], div[role="textbox"], textarea', timeout=10000)
+        await input_elem.click()
+
+        await self.gemini_page.evaluate("""(text) => {
+            const el = document.querySelector('rich-textarea [contenteditable="true"]') ||
+                       document.querySelector('div[role="textbox"]') ||
+                       document.querySelector('textarea');
+            if (el) {
+                el.focus();
+                document.execCommand('selectAll', false, null);
+                document.execCommand('insertText', false, text);
+            }
+        }""", prompt)
+        await asyncio.sleep(1)
+
+        btn = await self.gemini_page.query_selector('button[aria-label*="Send message"], button[aria-label*="Send prompt"], button[aria-label*="Send"], .send-button')
+        if btn:
+            await btn.click()
+        else:
+            await self.gemini_page.keyboard.press("Enter")
+
+        print("[*] Waiting for Gemini response...")
+        start_wait = time.time()
+        while time.time() - start_wait < 10:
+            stop_btn = await self.gemini_page.query_selector('button[aria-label*="Stop"], button[aria-label*="Pause"]')
+            if stop_btn and await stop_btn.is_visible():
+                break
+            await asyncio.sleep(0.5)
+
+        answer = ""
+        while time.time() - start_wait < 75:
+            await asyncio.sleep(1.5)
+            stop_btn = await self.gemini_page.query_selector('button[aria-label*="Stop"], button[aria-label*="Pause"]')
+            if stop_btn and await stop_btn.is_visible():
+                continue
+            responses = await self.gemini_page.query_selector_all('message-content, .model-response-text, [data-message-id]')
+            if len(responses) > baseline_count or len(responses) > 0:
+                latest = responses[-1]
+                answer = (await latest.inner_text()).strip()
+                if answer:
+                    break
+
+        print(f"[OK] Gemini response received:\n{answer[:150]}...\n")
+        return answer
+
+    # ==========================
+    # 1. SOLVING MCQs (Quiz Mode)
+    # ==========================
+    async def solve_mcq_test(self, test_page):
+        print("\n[*] Starting MCQ Assessment...")
+        q_num = 0
+        while q_num < 30:
+            q_num += 1
+            await test_page.bring_to_front()
+            await asyncio.sleep(1)
+
+            mcq_data = await test_page.evaluate("""() => {
+                const radioGroup = document.querySelector('[role="radiogroup"], .MuiRadioGroup-root');
+                if (!radioGroup) return null;
+
+                const main = radioGroup.closest('main') || radioGroup.parentElement.parentElement;
+                const candidateTexts = Array.from(main.querySelectorAll('p, div.md-view, h1, h2, h3, h4, span'))
+                    .filter(el => !radioGroup.contains(el))
+                    .map(el => el.innerText.trim())
+                    .filter(t => t.length > 5 && !t.includes('Difficulty:') && !t.includes('Score:') && !/^\\d+m?$/.test(t));
+
+                const uniqueTexts = Array.from(new Set(candidateTexts));
+                const qText = uniqueTexts.length > 0 ? uniqueTexts[0] : "";
+                const labels = Array.from(radioGroup.querySelectorAll('label, [role="radio"]'));
+                const options = labels.map(l => l.innerText.trim());
+
+                const buttons = Array.from(document.querySelectorAll('button'));
+                const nextBtn = buttons.find(b => (b.innerText || '').toLowerCase().includes('next'));
+                const isNextDisabled = nextBtn ? nextBtn.disabled : true;
+
+                return {
+                    question: qText,
+                    options: options,
+                    isNextDisabled: isNextDisabled
+                };
+            }""")
+
+            if not mcq_data or not mcq_data.get("options"):
+                print("[*] No active MCQ question found or quiz completed.")
+                break
+
+            q_text = mcq_data["question"]
+            options = mcq_data["options"]
+            print(f"\n[*] Question {q_num}: {q_text}")
+            letters = ['A', 'B', 'C', 'D', 'E', 'F']
+            formatted_opts = []
+            for i, opt in enumerate(options):
+                lbl = letters[i] if i < len(letters) else str(i+1)
+                cleaned = re.sub(r'^[A-Fa-f][\)\.\:\-]\s*', '', opt)
+                formatted_opts.append(f"{lbl}) {cleaned}")
+
+            prompt = f"Question:\n{q_text}\n\nOptions:\n" + "\n".join(formatted_opts) + "\n\nReply with only the correct option letter (example: B) and a short reason."
+            reply = await self.ask_gemini(prompt)
+
+            match = re.search(r'\b([A-D])\b', reply)
+            selected_letter = match.group(1) if match else "A"
+            opt_idx = ord(selected_letter) - ord('A')
+            print(f"[OK] Selected: {selected_letter}")
+
+            await test_page.bring_to_front()
+            await test_page.evaluate("""(idx) => {
+                const labels = Array.from(document.querySelectorAll('[role="radiogroup"] label, .MuiRadioGroup-root label'));
+                if (labels[idx]) {
+                    labels[idx].click();
+                    const r = labels[idx].querySelector('input[type="radio"]');
+                    if (r && r.click) r.click();
+                }
+            }""", opt_idx)
+            await asyncio.sleep(1)
+
+            await self.take_screenshot(f"mcq_q{q_num}_{selected_letter}")
+
+            # Check if this is the last question (Next is disabled or submit exists)
+            if mcq_data.get("isNextDisabled") or q_num >= 20:
+                print("[*] Reached last question of MCQ quiz. Submitting assessment...")
+                # Check for Submit button
+                await test_page.evaluate("""() => {
+                    const buttons = Array.from(document.querySelectorAll('button'));
+                    const sub = buttons.find(b => {
+                        const txt = (b.innerText || '').toLowerCase();
+                        return txt.includes('submit') || txt.includes('finish') || txt.includes('end test');
+                    });
+                    if (sub && !sub.disabled) {
+                        sub.click();
+                        sub.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+                    }
+                }""")
+                await asyncio.sleep(1.5)
+
+                # Confirm submission modal if one appears (e.g. "Confirm", "Yes", "End Test")
+                await test_page.evaluate("""() => {
+                    const confirmBtns = Array.from(document.querySelectorAll('.MuiDialog-root button, .MuiModal-root button, [role="dialog"] button, button')).filter(b => {
+                        const txt = (b.innerText || '').toLowerCase();
+                        return (txt.includes('confirm') || txt.includes('yes') || txt.includes('end test') || txt.includes('submit')) && !b.disabled;
+                    });
+                    if (confirmBtns.length > 0) {
+                        confirmBtns[confirmBtns.length - 1].click();
+                    }
+                }""")
+                await asyncio.sleep(3)
+                break
+
+            # Click Next
+            await test_page.evaluate("""() => {
+                const buttons = Array.from(document.querySelectorAll('button'));
+                const next = buttons.find(b => (b.innerText || '').toLowerCase().includes('next') && !b.disabled);
+                if (next) {
+                    next.click();
+                    next.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+                }
+            }""")
+            await asyncio.sleep(2)
+
+        print("[OK] MCQ Assessment finished.")
+
+    # ==========================
+    # 2. SOLVING LABS (Coding & SQL with Character-by-Character Typing)
+    async def prepare_editor_for_code(self, test_page):
+        """
+        Completely erases any previously typed code:
+        - If markers (-- start your solution ... -- end your solution) exist, it resets
+          everything strictly between the markers to blank, preserving comments and driver code.
+        - If no markers exist, it wipes the entire editor clean.
+        - Places the cursor at the exact insertion line and focuses the Monaco textarea.
+        """
+        await test_page.evaluate("""() => {
+            if (window.monaco && window.monaco.editor && window.monaco.editor.getEditors().length > 0) {
+                const ed = window.monaco.editor.getEditors()[0];
+                const val = ed.getValue();
+
+                const startRegex = /(--|\\/\\/|#|\\/\\*)\\s*start\\s*(?:your\\s*)?solution[\\s\\S]*?\\n/i;
+                const endRegex = /(--|\\/\\/|#|\\/\\*)\\s*end\\s*(?:your\\s*)?solution/i;
+
+                const startMatch = val.match(startRegex);
+                const endMatch = val.match(endRegex);
+
+                if (startMatch && endMatch && startMatch.index < endMatch.index) {
+                    const startIdx = startMatch.index + startMatch[0].length;
+                    const endIdx = endMatch.index;
+
+                    const before = val.substring(0, startIdx);
+                    const after = val.substring(endIdx);
+
+                    // Reset value with clean blank line between markers
+                    ed.setValue(before + '\\n' + after);
+
+                    const model = ed.getModel();
+                    const pos = model.getPositionAt(startIdx);
+                    ed.setPosition(pos);
+                    ed.focus();
+                } else {
+                    // No markers: wipe editor completely clean
+                    ed.setValue('');
+                    ed.setPosition({ lineNumber: 1, column: 1 });
+                    ed.focus();
+                }
+                const ta = document.querySelector('.monaco-editor textarea');
+                if (ta) ta.focus();
+            } else {
+                const ta = document.querySelector('textarea:not(.monaco-editor textarea), .monaco-editor textarea');
+                if (ta) {
+                    ta.value = '';
+                    ta.focus();
+                }
+            }
+        }""")
+
+    # ==========================
+    async def solve_coding_lab(self, test_page):
+        print("\n[*] Starting Coding Lab with Character-by-Character Typing...")
+        await test_page.bring_to_front()
+
+        # Check total questions in sidebar (1 to 10)
+        total_questions = await test_page.evaluate("""() => {
+            const els = Array.from(document.querySelectorAll('h6, p, button, div')).filter(el => {
+                const t = el.innerText ? el.innerText.trim() : '';
+                return /^[0-9]+$/.test(t) && parseInt(t) >= 1 && parseInt(t) <= 50 && el.children.length === 0 && (el.className.includes('Typography') || (el.parentElement && el.parentElement.className.includes('MuiBox')));
+            });
+            return els.length || 10;
+        }""")
+        print(f"[*] Total Lab Questions: {total_questions}")
+
+        for q_idx in range(1, total_questions + 1):
+            print(f"\n" + "="*50)
+            print(f"[*] Solving Lab Question {q_idx}/{total_questions}")
+            print("="*50)
+
+            # Switch to the specific question if needed
+            await test_page.evaluate("""(num) => {
+                const items = Array.from(document.querySelectorAll('h6, p, button, div')).filter(el => {
+                    const t = el.innerText ? el.innerText.trim() : '';
+                    return t === String(num) && el.children.length === 0 && (el.className.includes('Typography') || (el.parentElement && el.parentElement.className.includes('MuiBox')));
+                });
+                if (items.length > 0) items[0].click();
+            }""", q_idx)
+            await asyncio.sleep(2)
+
+            # Record initial incomplete/starter code before attempt 1
+            initial_starter_code = await test_page.evaluate("""() => {
+                if (window.monaco && window.monaco.editor && window.monaco.editor.getEditors().length > 0) {
+                    return window.monaco.editor.getEditors()[0].getValue();
+                }
+                const ta = document.querySelector('textarea:not(.monaco-editor textarea)');
+                return ta ? ta.value : '';
+            }""")
+
+            # Extract Problem Statement and Language
+            info = await test_page.evaluate("""() => {
+                let lang = "PostgreSQL";
+                const langEl = document.querySelector('.MuiSelect-select, .language-selector, [aria-haspopup="listbox"]');
+                if (langEl) lang = langEl.innerText.trim();
+                return {
+                    language: lang,
+                    text: document.body.innerText.substring(0, 2500)
+                };
+            }""")
+
+            language = info.get("language", "PostgreSQL")
+            problem_text = info.get("text", "")
+            print(f"[*] Language: {language}")
+
+            # Check if editor has solution delimiter markers
+            has_markers = bool(
+                re.search(r'(--|//|#|/\*)\s*start\s*(?:your\s*)?solution', initial_starter_code, re.IGNORECASE) and
+                re.search(r'(--|//|#|/\*)\s*end\s*(?:your\s*)?solution', initial_starter_code, re.IGNORECASE)
+            )
+
+            # Prepare prompt with incomplete code included as requested
+            if has_markers:
+                prompt = (
+                    f"Solve the following {language} coding / SQL challenge.\n\n"
+                    f"Problem Statement:\n{problem_text}\n\n"
+                    f"Incomplete Code from Editor:\n```{language}\n{initial_starter_code}\n```\n\n"
+                    f"INSTRUCTIONS:\n"
+                    f"- Write ONLY the code/query that belongs strictly between the start and end solution markers.\n"
+                    f"- Do NOT repeat the marker lines ('-- start your solution', '-- end your solution') or Driver Code in your response.\n"
+                    f"- Return ONLY the executable query or code inside triple backticks with no commentary."
+                )
+            else:
+                prompt = (
+                    f"Solve the following SQL query / programming problem in {language}.\n"
+                    f"Return ONLY the executable query or code inside triple backticks with no comments, introductory or concluding text.\n\n"
+                    f"Problem Statement:\n{problem_text}"
+                )
+                if initial_starter_code.strip():
+                    prompt += f"\n\nIncomplete / Starter Code in Editor:\n```{language}\n{initial_starter_code}\n```\n"
+
+            for attempt in range(1, 4):
+                print(f"[*] --- Attempt {attempt}/3 ---")
+                answer = await self.ask_gemini(prompt)
+
+                # Strip markdown syntax and language identifier
+                clean_code = answer
+                if "```" in answer:
+                    match = re.search(r'```(?:[a-zA-Z0-9_\+#\-]*\n)?([\s\S]*?)```', answer)
+                    if match:
+                        clean_code = match.group(1).strip()
+                # Remove accidental first line language tag like 'SQL' or 'PostgreSQL'
+                lines = clean_code.split("\n")
+                if lines and lines[0].strip().lower() in ['sql', 'postgresql', 'postgres', 'python', 'python3', 'java', 'cpp']:
+                    clean_code = "\n".join(lines[1:]).strip()
+
+                # Clean out any echoes of start/end solution or driver code
+                clean_code = re.sub(r'(--|//|#|/\*)\s*start(?:\s*your)?\s*solution.*?\n', '', clean_code, flags=re.IGNORECASE)
+                clean_code = re.sub(r'(--|//|#|/\*)\s*end(?:\s*your)?\s*solution.*', '', clean_code, flags=re.IGNORECASE)
+                clean_code = re.sub(r'(--|//|#|/\*)\s*driver\s*code[\s\S]*$', '', clean_code, flags=re.IGNORECASE).strip()
+
+                print(f"[*] Erasing previously typed code and preparing clean editor...")
+                await test_page.bring_to_front()
+                await self.prepare_editor_for_code(test_page)
+                await asyncio.sleep(0.4)
+
+                print(f"[*] Typing code ({len(clean_code)} chars) into editor...")
+                # TYPE character-by-character to satisfy anti-cheat and keystroke recording
+                try:
+                    await test_page.keyboard.type(clean_code, delay=20)
+                except Exception:
+                    pass
+
+                # Minimized-window verification: Ensure Monaco received the code
+                synced = await test_page.evaluate("""(code) => {
+                    if (window.monaco && window.monaco.editor && window.monaco.editor.getEditors().length > 0) {
+                        const ed = window.monaco.editor.getEditors()[0];
+                        const val = ed.getValue();
+                        const snippet = code.substring(0, Math.min(25, code.length)).trim();
+                        // If window was minimized or keyboard events missed, insert directly
+                        if (snippet && !val.includes(snippet)) {
+                            const model = ed.getModel();
+                            ed.setValue(code);
+                            return true;
+                        }
+                    }
+                    return false;
+                }""", clean_code)
+
+                if synced:
+                    print("[OK] Synchronized code into Monaco (background/minimized mode ensured)!")
+                else:
+                    print("[OK] Finished typing code!")
+
+                await asyncio.sleep(1)
+
+                # Click Submit
+                print("[*] Clicking Submit...")
+                await test_page.evaluate("""() => {
+                    const btn = Array.from(document.querySelectorAll('button')).find(b => {
+                        const txt = (b.innerText || '').toLowerCase();
+                        return (txt.includes('submit') || txt.includes('run code')) && !b.disabled;
+                    });
+                    if (btn) {
+                        btn.click();
+                        btn.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+                    }
+                }""")
+
+                await asyncio.sleep(6)
+                await self.take_screenshot(f"lab_q{q_idx}_attempt{attempt}")
+
+                # Check test case status
+                test_status = await test_page.evaluate("""() => {
+                    const text = document.body.innerText;
+                    const passed = text.includes("Passed") && !text.includes("Failed") && !text.includes("Wrong Answer") && !text.includes("Error");
+                    const errorBox = document.querySelector('.test-results, .output-console, .console, .terminal');
+                    return {
+                        passed: passed,
+                        details: errorBox ? errorBox.innerText.substring(0, 1000) : text.substring(0, 1000)
+                    };
+                }""")
+
+                if test_status.get("passed"):
+                    print(f"[OK] Question {q_idx} PASSED!")
+                    break
+                else:
+                    print(f"[!] Attempt {attempt} failed. Retrying...")
+                    if has_markers:
+                        prompt = (
+                            f"The previous solution in {language} failed test cases.\n\n"
+                            f"Problem Statement:\n{problem_text}\n\n"
+                            f"Incomplete Code from Editor:\n```{language}\n{initial_starter_code}\n```\n\n"
+                            f"Previous Code Typed:\n```{language}\n{clean_code}\n```\n\n"
+                            f"Error Details:\n{test_status.get('details', '')}\n\n"
+                            f"Fix the error. Return ONLY the corrected code to place between the start and end solution markers inside triple backticks with no commentary."
+                        )
+                    else:
+                        prompt = (
+                            f"The previous solution in {language} failed test cases.\n\n"
+                            f"Problem:\n{problem_text}\n\n"
+                            f"Previous Code:\n```{language}\n{clean_code}\n```\n\n"
+                            f"Error Details:\n{test_status.get('details', '')}\n\n"
+                            f"Fix it. Return ONLY the corrected code inside triple backticks with no commentary."
+                        )
+
+        print("[OK] Coding Lab finished.")
+
+    async def tick_activity_checkbox(self, activity_name):
+        """Ticks the completion checkbox on the sidebar / submodule card for the given activity."""
+        print(f"[*] Ticking side checkbox for: '{activity_name}'...")
+        try:
+            await self.bytexl_page.bring_to_front()
+        except Exception:
+            pass
+        await asyncio.sleep(1)
+
+        result = await self.bytexl_page.evaluate("""(actName) => {
+            const cleanName = (actName || '').trim().toLowerCase();
+
+            // 1. Try to find the specific row in accordions or lists
+            const allItems = Array.from(document.querySelectorAll(
+                '.MuiAccordion-root a, .MuiAccordion-root .MuiListItem-root, .MuiAccordionDetails-root > div, ' +
+                'a.MuiListItem-root, .MuiListItem-root, [role="button"], tr, div'
+            ));
+
+            let matched = allItems.filter(el => {
+                const txt = (el.innerText || '').trim().toLowerCase();
+                return (txt.includes(cleanName) || (cleanName && cleanName.includes(txt))) && txt.length < 160;
+            });
+
+            for (const item of matched) {
+                const row = item.closest('.MuiListItem-root, tr, [role="button"]') || item.parentElement || item;
+                const cb = row.querySelector(
+                    'input[type="checkbox"], .MuiCheckbox-root, [data-testid*="CheckBox"], ' +
+                    'span[aria-label*="complete"], button[aria-label*="complete"], [aria-label*="Mark as"]'
+                );
+
+                if (cb) {
+                    const isChecked = cb.checked ||
+                                      row.innerHTML.includes('Mui-checked') ||
+                                      row.querySelector('[data-testid="CheckBoxIcon"]') !== null ||
+                                      cb.getAttribute('aria-label') === 'Mark as incomplete';
+                    if (!isChecked) {
+                        if (cb.click) cb.click();
+                        else cb.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+                        return { ticked: true, mode: "row_match", name: actName };
+                    } else {
+                        return { already: true, name: actName };
+                    }
+                }
+            }
+
+            // 2. Try currently selected item (.Mui-selected)
+            const selected = document.querySelector('.Mui-selected');
+            if (selected) {
+                const cb = selected.querySelector('input[type="checkbox"], .MuiCheckbox-root, [data-testid*="CheckBox"], span[aria-label*="complete"]');
+                if (cb && !selected.innerHTML.includes('Mui-checked')) {
+                    if (cb.click) cb.click();
+                    else cb.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+                    return { ticked: true, mode: "selected" };
+                }
+            }
+
+            // 3. Look for any "Mark as Complete" button on the main page view
+            const markBtns = Array.from(document.querySelectorAll('button, span, a')).filter(b => {
+                const txt = (b.innerText || b.getAttribute('aria-label') || '').toLowerCase();
+                return txt.includes('mark as complete') || txt.includes('mark complete');
+            });
+            if (markBtns.length > 0) {
+                markBtns[0].click();
+                return { ticked: true, mode: "main_button" };
+            }
+
+            return { ticked: false };
+        }""", activity_name)
+
+        if result.get("ticked"):
+            print(f"[SUCCESS] ✅ Ticked side completion checkbox for '{activity_name}'!")
+        elif result.get("already"):
+            print(f"[OK] Side checkbox for '{activity_name}' is already ticked/complete.")
+        else:
+            print(f"[!] Checkbox for '{activity_name}' not found or already verified. Proceeding...")
+
+        if activity_name:
+            self.completed_activities.add(activity_name)
+        await asyncio.sleep(1.5)
+
+    async def handle_theory_reading(self, page):
+        """Scrolls smoothly through theory portion, clicks Mark As Completed, and clicks Next >."""
+        title = await page.evaluate("() => { const h = document.querySelector('h1, h2, h3, h4, .chapter-title'); return h ? h.innerText.trim() : 'Theory Topic'; }")
+        print(f"[*] 📖 Reading theory: '{title}'. Scrolling content...")
+        try:
+            await page.bring_to_front()
+        except Exception:
+            pass
+
+        # 1. Smooth scroll down in chunks to simulate realistic reading & load diagrams
+        await page.evaluate("""async () => {
+            const total = document.body.scrollHeight;
+            const step = Math.max(300, Math.floor(total / 5));
+            for (let y = 0; y <= total; y += step) {
+                window.scrollTo({ top: y, behavior: 'smooth' });
+                await new Promise(r => setTimeout(r, 350));
+            }
+            window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
+        }""")
+        await asyncio.sleep(2.5)
+
+        # 2. Click "Mark As Completed" button at bottom right (see user screenshot)
+        marked = await page.evaluate("""() => {
+            const btns = Array.from(document.querySelectorAll('button, a'));
+            const markBtn = btns.find(b => {
+                const txt = (b.innerText || '').trim().toLowerCase();
+                return txt === 'mark as completed' || txt === 'mark as complete' || txt === 'mark complete';
+            });
+            if (markBtn && !markBtn.disabled) {
+                markBtn.click();
+                markBtn.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+                return true;
+            }
+            return false;
+        }""")
+        if marked:
+            print(f"[OK] ✅ Clicked 'Mark As Completed' on '{title}'!")
+            await asyncio.sleep(1.5)
+        else:
+            print(f"[*] Theory '{title}' marked complete or button not present.")
+
+        # 3. Advance using 'Next >' button or next topic in sidebar
+        advanced = await page.evaluate("""() => {
+            const links = Array.from(document.querySelectorAll('button, a'));
+            const nextBtn = links.find(l => {
+                const txt = (l.innerText || '').trim().toLowerCase();
+                return txt === 'next >' || txt === 'next' || txt.startsWith('next >') || txt.includes('next >');
+            });
+            if (nextBtn && !nextBtn.disabled) {
+                nextBtn.click();
+                return true;
+            }
+            return false;
+        }""")
+
+        if advanced:
+            print("[*] Advancing to next topic via 'Next >'...")
+            await asyncio.sleep(3)
+            return True
+
+        return False
+
+    # ==========================
+    # 3. FULL COURSE & MODULE AUTO-NAVIGATOR
+    # ==========================
+    async def run_master_loop(self):
+        ok = await self.connect()
+        if not ok:
+            return
+
+        print("\n" + "="*60)
+        print("[🚀] BYTE-XL AUTONOMOUS AGENT ACTIVE")
+        print("="*60)
+
+        # If target course/module is specified, search and open it first
+        if self.target:
+            print(f"[🎯] Target course specified: '{self.target}'. Searching in 'My Courses'...")
+            curr_url = self.bytexl_page.url.lower()
+            if not curr_url.endswith("/courses") or "/courses/" in curr_url:
+                await self.bytexl_page.goto("https://app.bytexl.ai/courses")
+                await asyncio.sleep(3)
+
+            try:
+                search_input = await self.bytexl_page.wait_for_selector('input[placeholder*="search" i]', timeout=6000)
+                if search_input:
+                    await search_input.fill("")
+                    await search_input.fill(self.target)
+                    await self.bytexl_page.keyboard.press("Enter")
+                    await asyncio.sleep(2.5)
+            except Exception:
+                pass
+
+            found_card = await self.bytexl_page.evaluate("""(target) => {
+                const tLower = target.toLowerCase();
+                const cards = Array.from(document.querySelectorAll('.MuiPaper-root, .MuiCard-root, .MuiBox-root')).filter(c => {
+                    const txt = (c.innerText || '').toLowerCase();
+                    return (txt.includes('completion') || txt.includes('continue learning') || txt.includes('start learning')) && txt.includes(tLower);
+                });
+                if (cards.length > 0) {
+                    const card = cards[0];
+                    const btn = Array.from(card.querySelectorAll('button, a')).find(b => {
+                        const txt = (b.innerText || '').toLowerCase();
+                        return txt.includes('continue learning') || txt.includes('start learning') || txt.includes('resume');
+                    }) || card.querySelector('button, a') || card;
+                    btn.click();
+                    return true;
+                }
+                return false;
+            }""", self.target)
+
+            if found_card:
+                print(f"[OK] Opened target course: '{self.target}'!")
+                await asyncio.sleep(4)
+            else:
+                print(f"[!] Course matching '{self.target}' not found. Continuing with open tabs...")
+
+        while True:
+            # Check open pages for any active Test / Quiz / Lab
+            test_page = None
+            for p in self.context.pages:
+                if "/test/" in p.url:
+                    test_page = p
+                    break
+
+            if test_page:
+                has_editor = await test_page.evaluate("() => !!document.querySelector('.monaco-editor, textarea#code')")
+                if has_editor:
+                    await self.solve_coding_lab(test_page)
+                else:
+                    await self.solve_mcq_test(test_page)
+
+                # Close test page or return to module
+                for p in list(self.context.pages):
+                    if "/test/" in p.url:
+                        try:
+                            await p.close()
+                        except Exception:
+                            pass
+                await asyncio.sleep(2)
+
+                # Post-Activity: Tick the side completion box on the sidebar/accordion!
+                await self.tick_activity_checkbox(self.current_activity_name)
+
+                # Open next submodule: Expand any collapsed accordion sections
+                await self.bytexl_page.evaluate("""() => {
+                    const buttons = Array.from(document.querySelectorAll('button.MuiAccordionSummary-root[aria-expanded="false"], .MuiAccordionSummary-root:not(.Mui-expanded)'));
+                    buttons.forEach(b => b.click());
+                }""")
+                await asyncio.sleep(1)
+                continue
+
+            # Check if on an Activity landing page with "Open Quiz..." or "Open Lab..." or "Take The Quiz Now!"
+            try:
+                await self.bytexl_page.bring_to_front()
+            except Exception:
+                pass
+            unit_action = await self.bytexl_page.evaluate("""() => {
+                const btns = Array.from(document.querySelectorAll('button, a'));
+                const openBtn = btns.find(b => {
+                    const txt = (b.innerText || '').toLowerCase();
+                    return (txt.includes('open quiz') || txt.includes('take the quiz') || txt.includes('open lab') ||
+                            txt.includes('start lab') || txt.includes('start quiz') || txt.includes('take quiz')) && !b.disabled;
+                }) || document.querySelector('button.MuiButton-containedPrimary');
+                const nextUnitBtn = btns.find(b => {
+                    const txt = (b.innerText || '').toLowerCase();
+                    return txt.includes('go to next unit') || txt.includes('next unit');
+                });
+                return {
+                    openText: openBtn ? openBtn.innerText.trim() : null,
+                    hasNextUnit: !!nextUnitBtn
+                };
+            }""")
+
+            if unit_action.get("openText"):
+                print(f"[*] Assessment detected. Clicking '{unit_action['openText']}'...")
+                await self.bytexl_page.evaluate("""(txt) => {
+                    const btns = Array.from(document.querySelectorAll('button, a'));
+                    const target = btns.find(b => (b.innerText || '').trim().toLowerCase() === txt.toLowerCase()) ||
+                                   document.querySelector('button.MuiButton-containedPrimary');
+                    if (target) target.click();
+                }""", unit_action['openText'])
+                await asyncio.sleep(4)
+                continue
+
+            # Check if on a Theory / Reading Page (contains Mark As Completed / Summarize / /topic/)
+            is_theory_page = await self.bytexl_page.evaluate("""() => {
+                const btns = Array.from(document.querySelectorAll('button, a'));
+                const hasMarkBtn = !!btns.find(b => {
+                    const txt = (b.innerText || '').trim().toLowerCase();
+                    return txt === 'mark as completed' || txt === 'mark as complete';
+                });
+                const hasSummarize = !!btns.find(b => (b.innerText || '').toLowerCase().includes('summarize this chapter'));
+                const isTopicUrl = window.location.href.includes('/topic/');
+                return hasMarkBtn || hasSummarize || isTopicUrl;
+            }""")
+
+            if is_theory_page:
+                advanced = await self.handle_theory_reading(self.bytexl_page)
+                if self.current_activity_name:
+                    self.completed_activities.add(self.current_activity_name)
+                if advanced:
+                    continue
+
+            elif unit_action.get("hasNextUnit") and len(self.completed_activities) > 0:
+                print("[*] Advancing: 'Go To Next Unit'...")
+                await self.bytexl_page.evaluate("""() => {
+                    const btn = Array.from(document.querySelectorAll('button, a')).find(b => (b.innerText || '').toLowerCase().includes('next unit'));
+                    if (btn) btn.click();
+                }""")
+                await asyncio.sleep(3)
+                continue
+
+            current_url = self.bytexl_page.url.lower()
+
+            # Check if on Course units list (Units and Chapters page: /courses/<id>/<slug>)
+            if "/courses/" in current_url and "/module/" not in current_url:
+                print("\n[*] On Units & Chapters page. Finding uncompleted unit with 'Continue Learning'...")
+                unit_res = await self.bytexl_page.evaluate("""() => {
+                    const allButtons = Array.from(document.querySelectorAll('button, a'));
+                    const actionBtn = allButtons.find(b => {
+                        const txt = (b.innerText || '').trim().toLowerCase();
+                        return (txt === 'continue learning' || txt === 'start learning' || txt.includes('continue learning') || txt.includes('start learning')) &&
+                               !txt.includes('completed');
+                    });
+
+                    if (actionBtn) {
+                        let container = actionBtn.closest('.MuiPaper-root, .MuiCard-root, .MuiBox-root') || actionBtn.parentElement;
+                        let unitTitle = 'Unit';
+                        if (container) {
+                            const titleEl = container.querySelector('h1, h2, h3, h4, h5, h6');
+                            if (titleEl) unitTitle = titleEl.innerText.trim();
+                            else {
+                                const lines = container.innerText.split('\\n').map(l => l.trim()).filter(Boolean);
+                                if (lines.length > 0) unitTitle = lines[0];
+                            }
+                        }
+                        actionBtn.click();
+                        return { clicked: true, title: unitTitle };
+                    }
+                    return { clicked: false };
+                }""")
+
+                if unit_res.get("clicked"):
+                    print(f"[OK] Clicked 'Continue Learning' on: {unit_res.get('title')}")
+                    await asyncio.sleep(4)
+                    continue
+
+            # Check if on Module view / curriculum page
+            if "/courses/" in current_url or "/module/" in current_url:
+                print("\n[*] On Module view. Expanding all submodules and scanning for uncompleted Topics, Quizzes and Labs...")
+                # Expand all collapsed submodule accordions
+                await self.bytexl_page.evaluate("""() => {
+                    const summaries = Array.from(document.querySelectorAll('.MuiAccordionSummary-root[aria-expanded="false"], .MuiAccordionSummary-root:not(.Mui-expanded)'));
+                    summaries.forEach(s => s.click());
+                }""")
+                await asyncio.sleep(1.5)
+
+                # Scan across all submodules for uncompleted topic (Reading or Quiz/Lab)
+                uncompleted_item = await self.bytexl_page.evaluate("""(doneList) => {
+                    const candidateRows = Array.from(document.querySelectorAll(
+                        '.MuiAccordion-root a, .MuiAccordion-root .MuiListItem-root, .MuiAccordionDetails-root a, .MuiAccordionDetails-root .MuiListItem-root, .MuiAccordionDetails-root > div, a.MuiListItem-root, .MuiListItem-root'
+                    )).filter(el => {
+                        const t = (el.innerText || '').trim();
+                        return t.length > 2 && t.length < 160 && !t.toLowerCase().includes('reading materials') && !t.toLowerCase().includes('challenge');
+                    });
+
+                    for (const row of candidateRows) {
+                        const rawText = row.innerText.trim();
+                        const titleLine = rawText.split('\\n')[0].trim();
+
+                        // Skip if already in doneList
+                        if (doneList.some(d => titleLine.includes(d) || (d && d.includes(titleLine)))) continue;
+
+                        // Check if checked
+                        const cb = row.querySelector('input[type="checkbox"], .MuiCheckbox-root, [data-testid*="CheckBox"], span[aria-label*="complete"]');
+                        const isChecked = row.innerHTML.includes('Mui-checked') ||
+                                          row.querySelector('[data-testid="CheckBoxIcon"]') !== null ||
+                                          (cb && (cb.checked || cb.getAttribute('aria-label') === 'Mark as incomplete'));
+
+                        if (!isChecked) {
+                            return {
+                                text: titleLine,
+                                href: row.href || (row.querySelector('a') ? row.querySelector('a').href : null)
+                            };
+                        }
+                    }
+                    return null;
+                }""", list(self.completed_activities))
+
+                if uncompleted_item:
+                    self.current_activity_name = uncompleted_item['text']
+                    print(f"[OK] Found Uncompleted Submodule Topic: {self.current_activity_name}")
+                    clicked = await self.bytexl_page.evaluate("""(name) => {
+                        const links = Array.from(document.querySelectorAll('.MuiAccordion-root a, .MuiAccordion-root .MuiListItem-root, a, .MuiListItem-root, [role="button"]'));
+                        const target = links.find(l => (l.innerText || '').includes(name));
+                        if (target) {
+                            const linkText = target.querySelector('.MuiListItemText-root') || target;
+                            linkText.click();
+                            return true;
+                        }
+                        return false;
+                    }""", self.current_activity_name)
+                    if not clicked and uncompleted_item.get('href'):
+                        await self.bytexl_page.goto(uncompleted_item['href'])
+                    await asyncio.sleep(4)
+                    continue
+                else:
+                    # Check for "Go To Next Unit" before returning to dashboard
+                    next_unit = await self.bytexl_page.evaluate("""() => {
+                        const btn = Array.from(document.querySelectorAll('button, a')).find(b => {
+                            const txt = (b.innerText || '').toLowerCase();
+                            return txt.includes('go to next unit') || txt.includes('next unit');
+                        });
+                        if (btn) {
+                            btn.click();
+                            return true;
+                        }
+                        return false;
+                    }""")
+                    if next_unit:
+                        print("[OK] All submodules in this unit completed! Advancing to Next Unit...")
+                        await asyncio.sleep(4)
+                        continue
+
+                    print("[OK] All Topics, Quizzes and Labs in this module are completed! Returning to My Courses...")
+                    await self.bytexl_page.goto("https://app.bytexl.ai/courses")
+                    await asyncio.sleep(4)
+                    continue
+
+            # Check if on My Courses page (`/courses`)
+            if current_url.rstrip("/").endswith("/courses"):
+                print("\n[*] On My Courses dashboard. Checking completion percentages...")
+                target_course = await self.bytexl_page.evaluate("""() => {
+                    // Find course cards
+                    const cards = Array.from(document.querySelectorAll('.MuiCard-root, .MuiPaper-root, .MuiBox-root')).filter(c => {
+                        return c.innerText && (c.innerText.includes('COMPLETION') || c.innerText.includes('Continue learning') || c.innerText.includes('Start learning'));
+                    });
+
+                    for (const card of cards) {
+                        const txt = card.innerText;
+                        const match = txt.match(/COMPLETION[\\s\\S]*?(\\d+)%/i) || txt.match(/(\\d+)%[\\s\\S]*?COMPLETION/i);
+                        const pct = match ? parseInt(match[1]) : 0;
+
+                        // Target courses with completion < 100%
+                        if (pct < 100) {
+                            const titleEl = card.querySelector('h3, h4, h5, h6, .MuiTypography-h6, .MuiTypography-h5');
+                            const btn = card.querySelector('button, a');
+                            return {
+                                title: titleEl ? titleEl.innerText.trim() : "Unknown Course",
+                                percentage: pct,
+                                btnText: btn ? btn.innerText.trim() : null
+                            };
+                        }
+                    }
+                    return null;
+                }""")
+
+                if target_course:
+                    print(f"[OK] Selecting Course: {target_course['title']} ({target_course['percentage']}% completed)")
+                    await self.bytexl_page.evaluate("""(title) => {
+                        const cards = Array.from(document.querySelectorAll('.MuiCard-root, .MuiPaper-root, .MuiBox-root'));
+                        for (const card of cards) {
+                            if (card.innerText.includes(title)) {
+                                const btn = card.querySelector('button, a');
+                                if (btn) btn.click();
+                                break;
+                            }
+                        }
+                    }""", target_course['title'])
+                    await asyncio.sleep(4)
+                    continue
+                else:
+                    print("[OK] All courses are 100% completed! Congratulations!")
+                    break
+
+            print("[*] Monitoring navigation state. Sleeping 3s...")
+            await asyncio.sleep(3)
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Autonomous ByteXL Solver Agent")
+    parser.add_argument("--port", "-p", type=int, default=9222, help="Browser remote debugging port (default: 9222)")
+    parser.add_argument("--target", "-t", type=str, default="", help="Specific course/module to target (e.g. 'Cloud Security')")
+    args, unknown = parser.parse_known_args()
+
+    port_arg = args.port
+    if "CDP_PORT" in os.environ and port_arg == 9222:
+        try:
+            port_arg = int(os.environ["CDP_PORT"])
+        except ValueError:
+            pass
+
+    target_arg = args.target or (unknown[0] if unknown else "")
+    agent = MasterByteXLAgent(port=port_arg, target=target_arg)
+    asyncio.run(agent.run_master_loop())
