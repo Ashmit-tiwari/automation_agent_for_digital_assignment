@@ -13,6 +13,7 @@ INCLUDE_FILES = [
     "start_ui.bat",
     "run_agent.bat",
     "launch_debug_browser.bat",
+    "launch_with_existing_profile.bat",
 ]
 
 INCLUDE_DIRS = [

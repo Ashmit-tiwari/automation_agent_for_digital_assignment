@@ -1034,47 +1034,95 @@ class MasterByteXLAgent:
         print("[🚀] BYTE-XL AUTONOMOUS AGENT ACTIVE")
         print("="*60)
 
+        # Login Gatekeeper: Check if ByteXL is at login / signin screen
+        is_login = await self.bytexl_page.evaluate("""() => {
+            const url = window.location.href.toLowerCase();
+            if (url.includes('/login') || url.includes('/signin')) return true;
+            const hasPass = !!document.querySelector('input[type="password"]');
+            const hasSignIn = Array.from(document.querySelectorAll('button, input[type="submit"]')).some(b => {
+                const t = (b.innerText || b.value || '').toLowerCase();
+                return t.includes('sign in') || t.includes('log in') || t.includes('login');
+            });
+            return hasPass && hasSignIn;
+        }""")
+
+        if is_login:
+            print("[⚠️] You are on the ByteXL login page! Please log in to ByteXL in the browser.")
+            print("[*] The agent is paused and will automatically resume as soon as you log in...")
+            while True:
+                await asyncio.sleep(2)
+                still_login = await self.bytexl_page.evaluate("""() => {
+                    const url = window.location.href.toLowerCase();
+                    if (url.includes('/login') || url.includes('/signin')) return true;
+                    return !!document.querySelector('input[type="password"]');
+                }""")
+                if not still_login:
+                    print("[OK] ByteXL login detected! Proceeding to courses...")
+                    await asyncio.sleep(2)
+                    break
+
+        # Check Gemini sign-in notice
+        try:
+            gemini_login = await self.gemini_page.evaluate("""() => {
+                const url = window.location.href.toLowerCase();
+                return url.includes('accounts.google.com');
+            }""")
+            if gemini_login:
+                print("[⚠️] Notice: Please ensure you are signed into Gemini in the Gemini tab.")
+        except Exception:
+            pass
+
         # If target course/module is specified, search and open it first
         if self.target:
-            print(f"[🎯] Target course specified: '{self.target}'. Searching in 'My Courses'...")
-            curr_url = self.bytexl_page.url.lower()
-            if not curr_url.endswith("/courses") or "/courses/" in curr_url:
-                await self.bytexl_page.goto("https://app.bytexl.ai/courses")
-                await asyncio.sleep(3)
-
-            try:
-                search_input = await self.bytexl_page.wait_for_selector('input[placeholder*="search" i]', timeout=6000)
-                if search_input:
-                    await search_input.fill("")
-                    await search_input.fill(self.target)
-                    await self.bytexl_page.keyboard.press("Enter")
-                    await asyncio.sleep(2.5)
-            except Exception:
-                pass
-
-            found_card = await self.bytexl_page.evaluate("""(target) => {
-                const tLower = target.toLowerCase();
-                const cards = Array.from(document.querySelectorAll('.MuiPaper-root, .MuiCard-root, .MuiBox-root')).filter(c => {
-                    const txt = (c.innerText || '').toLowerCase();
-                    return (txt.includes('completion') || txt.includes('continue learning') || txt.includes('start learning')) && txt.includes(tLower);
-                });
-                if (cards.length > 0) {
-                    const card = cards[0];
-                    const btn = Array.from(card.querySelectorAll('button, a')).find(b => {
-                        const txt = (b.innerText || '').toLowerCase();
-                        return txt.includes('continue learning') || txt.includes('start learning') || txt.includes('resume');
-                    }) || card.querySelector('button, a') || card;
-                    btn.click();
-                    return true;
-                }
-                return false;
+            already_inside = await self.bytexl_page.evaluate("""(target) => {
+                const pageText = (document.body ? document.body.innerText : '').toLowerCase();
+                const t = target.toLowerCase();
+                const isCourseUrl = window.location.href.includes('/courses/') || window.location.href.includes('/module/');
+                return isCourseUrl && pageText.includes(t);
             }""", self.target)
 
-            if found_card:
-                print(f"[OK] Opened target course: '{self.target}'!")
-                await asyncio.sleep(4)
+            if already_inside:
+                print(f"[🎯] Already inside target course: '{self.target}'! Continuing directly...")
             else:
-                print(f"[!] Course matching '{self.target}' not found. Continuing with open tabs...")
+                print(f"[🎯] Target course specified: '{self.target}'. Searching in 'My Courses'...")
+                curr_url = self.bytexl_page.url.lower()
+                if not curr_url.rstrip("/").endswith("/courses"):
+                    await self.bytexl_page.goto("https://app.bytexl.ai/courses")
+                    await asyncio.sleep(3)
+
+                try:
+                    search_input = await self.bytexl_page.wait_for_selector('input[placeholder*="search" i]', timeout=6000)
+                    if search_input:
+                        await search_input.fill("")
+                        await search_input.fill(self.target)
+                        await self.bytexl_page.keyboard.press("Enter")
+                        await asyncio.sleep(2.5)
+                except Exception:
+                    pass
+
+                found_card = await self.bytexl_page.evaluate("""(target) => {
+                    const tLower = target.toLowerCase();
+                    const cards = Array.from(document.querySelectorAll('.MuiPaper-root, .MuiCard-root, .MuiBox-root')).filter(c => {
+                        const txt = (c.innerText || '').toLowerCase();
+                        return (txt.includes('completion') || txt.includes('continue learning') || txt.includes('start learning')) && txt.includes(tLower);
+                    });
+                    if (cards.length > 0) {
+                        const card = cards[0];
+                        const btn = Array.from(card.querySelectorAll('button, a')).find(b => {
+                            const txt = (b.innerText || '').toLowerCase();
+                            return txt.includes('continue learning') || txt.includes('start learning') || txt.includes('resume');
+                        }) || card.querySelector('button, a') || card;
+                        btn.click();
+                        return true;
+                    }
+                    return false;
+                }""", self.target)
+
+                if found_card:
+                    print(f"[OK] Opened target course: '{self.target}'!")
+                    await asyncio.sleep(4)
+                else:
+                    print(f"[!] Course matching '{self.target}' not found on dashboard. Continuing with active tabs...")
 
         while True:
             # Check open pages for any active Test / Quiz / Lab
@@ -1317,7 +1365,6 @@ class MasterByteXLAgent:
                         }
 
                         // Check if checked
-                        const cb = row.querySelector('input[type="checkbox"], .MuiCheckbox-root, [data-testid*="CheckBox"], span[aria-label*="complete"]');
                         const cb = row.querySelector('input[type="checkbox"], .MuiCheckbox-root, [data-testid*="CheckBox"], [data-testid*="Check"], span[aria-label*="complete"]');
                         const isChecked = row.innerHTML.includes('Mui-checked') ||
                                           row.querySelector('[data-testid="CheckBoxIcon"]') !== null ||
@@ -1372,9 +1419,13 @@ class MasterByteXLAgent:
                         await asyncio.sleep(4)
                         continue
 
-                    print("[OK] All Topics, Quizzes and Labs in this module are completed! Returning to My Courses...")
-                    await self.bytexl_page.goto("https://app.bytexl.ai/courses")
-                    await asyncio.sleep(4)
+                    if len(self.completed_activities) > 0:
+                        print("[OK] All Topics, Quizzes and Labs in this module are completed! Returning to My Courses...")
+                        await self.bytexl_page.goto("https://app.bytexl.ai/courses")
+                        await asyncio.sleep(4)
+                    else:
+                        print("[*] No uncompleted items found on this screen. Checking course status...")
+                        await asyncio.sleep(3)
                     continue
 
             # Check if on My Courses page (`/courses`)
@@ -1420,8 +1471,18 @@ class MasterByteXLAgent:
                     await asyncio.sleep(4)
                     continue
                 else:
-                    print("[OK] All courses are 100% completed! Congratulations!")
-                    break
+                    has_cards = await self.bytexl_page.evaluate("""() => {
+                        return Array.from(document.querySelectorAll('.MuiCard-root, .MuiPaper-root, .MuiBox-root')).some(c => {
+                            return c.innerText && (c.innerText.includes('COMPLETION') || c.innerText.includes('Continue learning') || c.innerText.includes('Start learning'));
+                        });
+                    }""")
+                    if has_cards:
+                        print("[OK] All courses are 100% completed! Congratulations!")
+                        break
+                    else:
+                        print("[!] No course cards detected on /courses page yet. Retrying...")
+                        await asyncio.sleep(3)
+                        continue
 
             print("[*] Monitoring navigation state. Sleeping 3s...")
             await asyncio.sleep(3)

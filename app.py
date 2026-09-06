@@ -1005,54 +1005,109 @@ class AutonomousByteXLAgent:
         if not ok:
             return False
 
+        # Login Gatekeeper: Check if ByteXL is at login / signin screen
+        is_login = await self.bytexl_page.evaluate("""() => {
+            const url = window.location.href.toLowerCase();
+            if (url.includes('/login') || url.includes('/signin')) return true;
+            const hasPass = !!document.querySelector('input[type="password"]');
+            const hasSignIn = Array.from(document.querySelectorAll('button, input[type="submit"]')).some(b => {
+                const t = (b.innerText || b.value || '').toLowerCase();
+                return t.includes('sign in') || t.includes('log in') || t.includes('login');
+            });
+            return hasPass && hasSignIn;
+        }""")
+
+        if is_login:
+            self.ctrl.state = "Waiting for ByteXL Login..."
+            self.ctrl.log("⚠️ You are on the ByteXL login page! Please log in to ByteXL in the browser.", "warn")
+            self.ctrl.log("💡 The agent is paused and will automatically resume as soon as you log in.", "info")
+            while not self.ctrl.stop_requested:
+                await asyncio.sleep(2)
+                still_login = await self.bytexl_page.evaluate("""() => {
+                    const url = window.location.href.toLowerCase();
+                    if (url.includes('/login') || url.includes('/signin')) return true;
+                    return !!document.querySelector('input[type="password"]');
+                }""")
+                if not still_login:
+                    self.ctrl.log("✅ ByteXL login detected! Proceeding with course automation...", "success")
+                    await asyncio.sleep(2)
+                    break
+
+        if self.ctrl.stop_requested:
+            self.ctrl.state = "Stopped by User"
+            await self.close()
+            return False
+
+        # Check Gemini sign-in notice
+        try:
+            gemini_login = await self.gemini_page.evaluate("""() => {
+                const url = window.location.href.toLowerCase();
+                return url.includes('accounts.google.com');
+            }""")
+            if gemini_login:
+                self.ctrl.log("⚠️ Notice: Please ensure you are signed into Gemini in the Gemini tab.", "warn")
+        except Exception:
+            pass
+
         self.ctrl.state = "Navigating Course..."
 
         target_course = (self.ctrl.target_module or "").strip()
 
         # If a specific target course/module was specified (e.g. "System Design" or "Cloud Security")
         if target_course:
-            self.ctrl.log(f"🎯 Target course specified: '{target_course}'. Searching in 'My Courses'...", "info")
-            curr_url = self.bytexl_page.url.lower()
-            if not curr_url.endswith("/courses") or "/courses/" in curr_url:
-                try:
-                    await self.bytexl_page.goto("https://app.bytexl.ai/courses")
-                    await asyncio.sleep(3)
-                except Exception:
-                    pass
-
-            try:
-                search_input = await self.bytexl_page.wait_for_selector('input[placeholder*="search" i]', timeout=6000)
-                if search_input:
-                    await search_input.fill("")
-                    await search_input.fill(target_course)
-                    await self.bytexl_page.keyboard.press("Enter")
-                    await asyncio.sleep(2.5)
-            except Exception as e:
-                self.ctrl.log(f"Search input interaction: {e}", "warn")
-
-            found_card = await self.bytexl_page.evaluate("""(target) => {
-                const tLower = target.toLowerCase();
-                const cards = Array.from(document.querySelectorAll('.MuiPaper-root, .MuiCard-root, .MuiBox-root')).filter(c => {
-                    const txt = (c.innerText || '').toLowerCase();
-                    return (txt.includes('completion') || txt.includes('continue learning') || txt.includes('start learning') || txt.includes('resume')) && txt.includes(tLower);
-                });
-                if (cards.length > 0) {
-                    const card = cards[0];
-                    const btn = Array.from(card.querySelectorAll('button, a')).find(b => {
-                        const txt = (b.innerText || '').toLowerCase();
-                        return txt.includes('continue learning') || txt.includes('start learning') || txt.includes('resume');
-                    }) || card.querySelector('button, a') || card;
-                    btn.click();
-                    return true;
-                }
-                return false;
+            # Check if browser is already inside the targeted course
+            already_inside = await self.bytexl_page.evaluate("""(target) => {
+                const pageText = (document.body ? document.body.innerText : '').toLowerCase();
+                const t = target.toLowerCase();
+                const isCourseUrl = window.location.href.includes('/courses/') || window.location.href.includes('/module/');
+                return isCourseUrl && pageText.includes(t);
             }""", target_course)
 
-            if found_card:
-                self.ctrl.log(f"Opened target course: '{target_course}'!", "success")
-                await asyncio.sleep(4)
+            if already_inside:
+                self.ctrl.log(f"🎯 Already inside target course: '{target_course}'! Continuing directly...", "success")
             else:
-                self.ctrl.log(f"Target '{target_course}' search finished. Continuing with active course...", "info")
+                self.ctrl.log(f"🎯 Target course specified: '{target_course}'. Searching in 'My Courses'...", "info")
+                curr_url = self.bytexl_page.url.lower()
+                if not curr_url.rstrip("/").endswith("/courses"):
+                    try:
+                        await self.bytexl_page.goto("https://app.bytexl.ai/courses")
+                        await asyncio.sleep(3)
+                    except Exception:
+                        pass
+
+                try:
+                    search_input = await self.bytexl_page.wait_for_selector('input[placeholder*="search" i]', timeout=6000)
+                    if search_input:
+                        await search_input.fill("")
+                        await search_input.fill(target_course)
+                        await self.bytexl_page.keyboard.press("Enter")
+                        await asyncio.sleep(2.5)
+                except Exception as e:
+                    self.ctrl.log(f"Search input interaction: {e}", "warn")
+
+                found_card = await self.bytexl_page.evaluate("""(target) => {
+                    const tLower = target.toLowerCase();
+                    const cards = Array.from(document.querySelectorAll('.MuiPaper-root, .MuiCard-root, .MuiBox-root')).filter(c => {
+                        const txt = (c.innerText || '').toLowerCase();
+                        return (txt.includes('completion') || txt.includes('continue learning') || txt.includes('start learning') || txt.includes('resume')) && txt.includes(tLower);
+                    });
+                    if (cards.length > 0) {
+                        const card = cards[0];
+                        const btn = Array.from(card.querySelectorAll('button, a')).find(b => {
+                            const txt = (b.innerText || '').toLowerCase();
+                            return txt.includes('continue learning') || txt.includes('start learning') || txt.includes('resume');
+                        }) || card.querySelector('button, a') || card;
+                        btn.click();
+                        return true;
+                    }
+                    return false;
+                }""", target_course)
+
+                if found_card:
+                    self.ctrl.log(f"Opened target course: '{target_course}'!", "success")
+                    await asyncio.sleep(4)
+                else:
+                    self.ctrl.log(f"Target '{target_course}' search finished. Continuing with active course...", "info")
 
         # Stage 1 (Fallback / default if on /courses): click course card with < 100% completion
         curr_url = self.bytexl_page.url.lower()
@@ -1465,28 +1520,64 @@ class AutonomousByteXLAgent:
                     await self.bytexl_page.goto(uncompleted["href"])
                 await asyncio.sleep(4)
             else:
-                self.ctrl.log("All topics, quizzes, and labs in this unit are completed!", "success")
+                if activities_completed > 0:
+                    self.ctrl.log("All topics, quizzes, and labs in this unit are completed!", "success")
                 break
+
+        if self.ctrl.stop_requested:
+            self.ctrl.state = "Stopped by User"
+            self.ctrl.log("Automation stopped by user.", "warn")
+            await self.close()
+            return False
 
         # Finished 1 Module!
         mod_name = self.ctrl.current_module_name or target_course or "Module"
-        self.ctrl.state = f"Completed {mod_name} (100%)"
-        self.ctrl.log(f"🎉 Completed {mod_name} with 100%!", "success")
+        if activities_completed > 0:
+            self.ctrl.state = f"Completed {mod_name} (100%)"
+            self.ctrl.log(f"🎉 Completed {mod_name} with 100%!", "success")
 
-        # Set user report with action buttons
-        self.ctrl.pending_report = f"""
-        <div class="report-card">
-            <h4>🎉 Module Completed: {mod_name} (100%)</h4>
-            <p>All quizzes, lab challenges, and submodules have been completed and side boxes ticked!</p>
-            <p style="margin-top: 8px; color: var(--text-heading); font-weight: 500;">
-                What would you like to do next?
-            </p>
-            <div class="action-buttons">
-                <button class="btn-action btn-proceed" onclick="sendQuick('proceed with next module')">Proceed with Next Module</button>
-                <button class="btn-action btn-stop" onclick="sendQuick('stop')">Stop & End Session</button>
+            # Set user report with action buttons
+            self.ctrl.pending_report = f"""
+            <div class="report-card">
+                <h4>🎉 Module Completed: {mod_name} (100%)</h4>
+                <p>All quizzes, lab challenges, and submodules have been completed and side boxes ticked!</p>
+                <p style="margin-top: 8px; color: var(--text-heading); font-weight: 500;">
+                    What would you like to do next?
+                </p>
+                <div class="action-buttons">
+                    <button class="btn-action btn-proceed" onclick="sendQuick('proceed with next module')">Proceed with Next Module</button>
+                    <button class="btn-action btn-stop" onclick="sendQuick('stop')">Stop & End Session</button>
+                </div>
             </div>
-        </div>
-        """
+            """
+        else:
+            # Check if topics were already completed or page had no topics
+            has_topics = await self.bytexl_page.evaluate("""() => {
+                const candidateRows = Array.from(document.querySelectorAll(
+                    '.MuiAccordion-root a, .MuiAccordion-root .MuiListItem-root, .MuiAccordionDetails-root a, .MuiAccordionDetails-root .MuiListItem-root, .MuiAccordionDetails-root > div, a.MuiListItem-root, .MuiListItem-root'
+                )).filter(el => {
+                    const t = (el.innerText || '').trim();
+                    return t.length > 2 && t.length < 160 && !t.toLowerCase().includes('reading materials') && !t.toLowerCase().includes('challenge');
+                });
+                return candidateRows.length > 0;
+            }""")
+            if has_topics:
+                self.ctrl.state = f"{mod_name} Already Completed"
+                self.ctrl.log(f"ℹ️ All submodules and activities in '{mod_name}' were already completed!", "info")
+                self.ctrl.pending_report = f"""
+                <div class="report-card">
+                    <h4>✅ Module Already Completed: {mod_name}</h4>
+                    <p>Every quiz, lab, and topic in this module was already completed.</p>
+                    <div class="action-buttons">
+                        <button class="btn-action btn-proceed" onclick="sendQuick('proceed with next module')">Proceed with Next Module</button>
+                        <button class="btn-action btn-stop" onclick="sendQuick('stop')">Stop</button>
+                    </div>
+                </div>
+                """
+            else:
+                self.ctrl.state = "Waiting inside Course"
+                self.ctrl.log("⚠️ No course submodules found on current page. Please open a course in ByteXL and click Proceed.", "warn")
+
         await self.close()
         return True
 
