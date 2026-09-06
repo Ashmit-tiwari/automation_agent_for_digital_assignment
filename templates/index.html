@@ -568,16 +568,19 @@
                     <div class="avatar">AI</div>
                     <div class="msg-bubble">
                         👋 Welcome to <strong>ByteXL Copilot</strong>!<br><br>
-                        Just type <strong>"proceed with bytexl"</strong> or target a specific course with <strong>"proceed with cloud security"</strong>.<br>
-                        I will automatically connect to your open ByteXL course, solve quizzes and labs using Gemini, tick each side completion box, and pause with a <strong>100% completion report</strong> after each module.
+                        Type <strong>"proceed with brave browser"</strong>, <strong>"proceed with chrome"</strong>, or <strong>"proceed with bytexl"</strong> to launch and solve with your chosen browser.<br>
+                        You can also target specific courses: <code>proceed with brave browser for system design</code>.<br>
+                        The agent will connect, tick all completion boxes, solve quizzes & labs with Gemini, and stop with a 100% completion report.
                     </div>
                 </div>
             </div>
 
             <div class="chat-input-wrapper">
                 <div class="quick-chips">
+                    <button class="chip" onclick="sendQuick('proceed with brave browser')">🦁 proceed with brave browser</button>
+                    <button class="chip" onclick="sendQuick('proceed with chrome browser')">🟡 proceed with chrome browser</button>
+                    <button class="chip" onclick="sendQuick('proceed with edge browser')">🔵 proceed with edge browser</button>
                     <button class="chip" onclick="sendQuick('proceed with bytexl')">▶ proceed with bytexl</button>
-                    <button class="chip" onclick="sendQuick('proceed with cloud security')">🎯 proceed with cloud security</button>
                     <button class="chip" onclick="sendQuick('proceed with next module')">⏩ proceed with next module</button>
                     <button class="chip" onclick="sendQuick('stop')">⏹ stop</button>
                 </div>

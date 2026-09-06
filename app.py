@@ -123,12 +123,14 @@ def check_cdp_port(port, timeout=0.8):
     except Exception:
         return False, None
 
-def find_active_browser_port(start_port=9222, end_port=9235):
+def find_active_browser_port(start_port=9222, end_port=9235, preferred=None):
     """
     Intelligently scans open browser debugging ports:
-    1. Highest priority: The browser port that currently has a ByteXL tab open!
-    2. Second priority: The browser port with Gemini open.
-    3. Third priority: Any active browser port.
+    1. Highest priority: Browser matching preferred name (e.g. Brave) with ByteXL open.
+    2. Second priority: Browser matching preferred name.
+    3. Third priority: Any browser with ByteXL tab open.
+    4. Fourth priority: Any browser with Gemini open.
+    5. Fallback: First available browser port.
     """
     ports_found = []
     for p in range(start_port, end_port + 1):
@@ -139,17 +141,31 @@ def find_active_browser_port(start_port=9222, end_port=9235):
     if not ports_found:
         return None, None
 
-    # Priority 1: Port with ByteXL tab
+    pref_clean = (preferred or "").lower().strip()
+    if pref_clean and pref_clean != "auto":
+        # 1. Match preferred browser with ByteXL
+        for p, info in ports_found:
+            b = (info.get("browser") or "").lower()
+            if pref_clean in b and info.get("has_bytexl"):
+                return p, info.get("browser", "Chromium")
+
+        # 2. Match preferred browser
+        for p, info in ports_found:
+            b = (info.get("browser") or "").lower()
+            if pref_clean in b:
+                return p, info.get("browser", "Chromium")
+
+    # Priority 3: Port with ByteXL tab
     for p, info in ports_found:
         if info.get("has_bytexl"):
             return p, info.get("browser", "Chromium")
 
-    # Priority 2: Port with Gemini tab
+    # Priority 4: Port with Gemini tab
     for p, info in ports_found:
         if info.get("has_gemini"):
             return p, info.get("browser", "Chromium")
 
-    # Priority 3: First available port
+    # Priority 5: First available port
     return ports_found[0][0], ports_found[0][1].get("browser", "Chromium")
 
 def find_free_port(start_port=9222, max_scan=50):
@@ -268,34 +284,49 @@ class AutonomousByteXLAgent:
         self.gemini_page = None
 
     def ensure_browser_running(self):
+        pref = getattr(self.ctrl, "preferred_browser", "auto")
         target_port = self.ctrl.cdp_port or 9222
         ok, info = check_cdp_port(target_port, timeout=1.0)
+        
+        # If target port is active, check if it matches requested preferred browser
         if ok and info:
             b_name = info.get("browser", "Chromium")
-            self.ctrl.last_detected_browser = b_name
-            self.ctrl.port_error = False
-            if info.get("has_bytexl"):
-                self.ctrl.log(f"🎯 Found active ByteXL session in {b_name} on port {target_port}!", "success")
-            return True
+            if pref == "auto" or pref.lower() in b_name.lower():
+                self.ctrl.last_detected_browser = b_name
+                self.ctrl.port_error = False
+                if info.get("has_bytexl"):
+                    self.ctrl.log(f"🎯 Found active ByteXL session in {b_name} on port {target_port}!", "success")
+                else:
+                    self.ctrl.log(f"Connected to {b_name} on port {target_port}.", "info")
+                return True
+            else:
+                self.ctrl.log(f"Port {target_port} currently has {b_name}, looking for {pref.upper()}...", "info")
 
-        # Scan other ports (9222 - 9235) prioritizing any browser where ByteXL is open
-        active_port, active_browser = find_active_browser_port(9222, 9235)
+        # Scan other ports (9222 - 9235) prioritizing preferred browser
+        active_port, active_browser = find_active_browser_port(9222, 9235, preferred=pref)
         if active_port:
-            self.ctrl.log(f"Auto-detected browser ({active_browser}) on port {active_port}! Switching to port {active_port}...", "success")
-            self.ctrl.cdp_port = active_port
-            self.ctrl.last_detected_browser = active_browser
-            self.ctrl.port_error = False
-            return True
+            if pref == "auto" or pref.lower() in active_browser.lower():
+                self.ctrl.log(f"Detected {active_browser} on port {active_port}! Switching to port {active_port}...", "success")
+                self.ctrl.cdp_port = active_port
+                self.ctrl.last_detected_browser = active_browser
+                self.ctrl.port_error = False
+                return True
 
-        # If not running on port, launch preferred or auto-detected browser
-        exe = find_installed_browser(self.ctrl.preferred_browser)
+        # If target_port is occupied by a different browser, pick a free port for requested browser
+        if ok and info and pref != "auto" and pref.lower() not in info.get("browser", "").lower():
+            target_port = find_free_port(9223)
+            self.ctrl.cdp_port = target_port
+            self.ctrl.log(f"Port 9222 is in use by another browser. Using port {target_port} for {pref.capitalize()}...", "info")
+
+        # Launch preferred browser
+        exe = find_installed_browser(pref)
         proc_name = os.path.basename(exe)
         b_label = proc_name.replace(".exe", "").capitalize()
 
         self.ctrl.log(f"Launching {b_label} with remote debugging on port {target_port}...", "info")
-        launch_browser_on_port(target_port, self.ctrl.preferred_browser)
+        launch_browser_on_port(target_port, pref)
 
-        self.ctrl.log(f"Waiting for browser on port {target_port}...", "info")
+        self.ctrl.log(f"Waiting for {b_label} on port {target_port}...", "info")
         for i in range(12):
             time.sleep(1)
             ok, info = check_cdp_port(target_port, timeout=1.0)
@@ -329,9 +360,10 @@ class AutonomousByteXLAgent:
             except Exception:
                 await asyncio.sleep(1.0)
 
-        # Fallback: scan if browser opened on another port (prioritizing ByteXL)
+        # Fallback: scan if browser opened on another port (prioritizing preferred browser & ByteXL)
+        pref = getattr(self.ctrl, "preferred_browser", "auto")
         if not self.browser:
-            active_p, active_b = find_active_browser_port(9222, 9235)
+            active_p, active_b = find_active_browser_port(9222, 9235, preferred=pref)
             if active_p and active_p != target_port:
                 self.ctrl.log(f"Found active browser ({active_b}) on port {active_p}. Auto-connecting...", "info")
                 try:
@@ -1109,6 +1141,12 @@ class AutonomousByteXLAgent:
                 else:
                     self.ctrl.log(f"Target '{target_course}' search finished. Continuing with active course...", "info")
 
+            if found_card:
+                self.ctrl.log(f"Opened target course: '{target_course}'!", "success")
+                await asyncio.sleep(4)
+            else:
+                self.ctrl.log(f"Target '{target_course}' search finished. Continuing with active course...", "info")
+
         # Stage 1 (Fallback / default if on /courses): click course card with < 100% completion
         curr_url = self.bytexl_page.url.lower()
         if curr_url.rstrip("/").endswith("/courses"):
@@ -1520,6 +1558,7 @@ class AutonomousByteXLAgent:
                     await self.bytexl_page.goto(uncompleted["href"])
                 await asyncio.sleep(4)
             else:
+                self.ctrl.log("All topics, quizzes, and labs in this unit are completed!", "success")
                 if activities_completed > 0:
                     self.ctrl.log("All topics, quizzes, and labs in this unit are completed!", "success")
                 break
@@ -1535,7 +1574,6 @@ class AutonomousByteXLAgent:
         if activities_completed > 0:
             self.ctrl.state = f"Completed {mod_name} (100%)"
             self.ctrl.log(f"🎉 Completed {mod_name} with 100%!", "success")
-
             # Set user report with action buttons
             self.ctrl.pending_report = f"""
             <div class="report-card">
@@ -1743,45 +1781,76 @@ def handle_chat():
         controller.state = "Session Stopped"
         controller.log("⏹ Session stopped by user request.", "warn")
         return jsonify({
-            "reply": "⏹ <strong>Session stopped.</strong><br>Agent has paused. Whenever you are ready to resume, just click or type <strong>'proceed with bytexl'</strong> or <strong>'proceed with next module'</strong>."
+            "reply": "⏹ <strong>Session stopped.</strong><br>Agent has paused. Whenever you are ready to resume, just click or type <strong>'proceed with bytexl'</strong> or <strong>'proceed with brave browser'</strong>."
         })
 
-    # 2. Clear target command
+    # 2. Browser detection & switching (e.g. "proceed with brave browser", "use chrome", "open brave")
+    named_browser = None
+    if "brave" in msg:
+        named_browser = "brave"
+    elif "chrome" in msg:
+        named_browser = "chrome"
+    elif "edge" in msg:
+        named_browser = "edge"
+
+    if named_browser:
+        controller.preferred_browser = named_browser
+        controller.log(f"🌐 Preferred browser set to: {named_browser.upper()}", "info")
+
+    # 3. Clear target command
     if msg in ["clear target", "reset target", "remove target"]:
         controller.target_module = ""
         controller.log("Target cleared.", "info")
         return jsonify({"reply": "Target course cleared. Normal course traversal is now active."})
 
-    # 3. Target command (e.g. "proceed with system design", "target cloud security")
-    target_match = re.search(r'^(?:proceed\s+with|target|solve|complete|search)\s+(.+)$', msg, re.IGNORECASE)
-    if target_match:
-        extracted = target_match.group(1).strip()
-        if extracted.lower() not in ["bytexl", "next module", "the course"]:
-            controller.target_module = extracted
-            controller.log(f"🎯 Target course set to: '{controller.target_module}'", "info")
+    # 4. Check if this is a browser-only command (e.g. "use brave browser", "switch to chrome", "brave")
+    is_pure_browser_switch = re.match(r'^(?:use|switch\s+to|set|select)?\s*(?:brave|chrome|edge)(?:\s+browser)?$', msg)
+    if is_pure_browser_switch and not any(k in msg for k in ["proceed", "start", "solve", "run"]):
+        return jsonify({
+            "reply": f"🌐 Target browser switched to <strong>{named_browser.capitalize()}</strong>.<br>Type <strong>'proceed with {named_browser} browser'</strong> to begin solving with {named_browser.capitalize()}!"
+        })
 
-    # 4. Start / Proceed command
-    is_start = any(k in msg for k in ["proceed with bytexl", "proceed with next module", "start", "resume", "run"]) or target_match
+    # 5. Extract course target (if specified, e.g. "proceed with system design" or "proceed with brave browser for cloud security")
+    cleaned_target_candidate = msg
+    for prefix in ["proceed with", "target", "solve", "complete", "search", "use", "switch to", "open", "launch"]:
+        if cleaned_target_candidate.startswith(prefix):
+            cleaned_target_candidate = cleaned_target_candidate[len(prefix):].strip()
+            break
+
+    # Strip browser mentions from course target candidate (e.g. "brave browser", "in brave", "on brave")
+    cleaned_target_candidate = re.sub(r'\b(in|on|with|using)?\s*(brave|chrome|edge)\s*(browser)?\b', '', cleaned_target_candidate).strip()
+    cleaned_target_candidate = re.sub(r'^(for|on|in|to)\s+', '', cleaned_target_candidate).strip()
+
+    if cleaned_target_candidate and cleaned_target_candidate.lower() not in ["bytexl", "next module", "the course", "course", "browser", ""]:
+        controller.target_module = cleaned_target_candidate
+        controller.log(f"🎯 Target course set to: '{controller.target_module}'", "info")
+
+    # 6. Start / Proceed command
+    is_start = any(k in msg for k in ["proceed", "start", "resume", "run", "solve"]) or named_browser
     if is_start:
         if controller.state.startswith("Processing") or controller.state.startswith("Navigating"):
-            return jsonify({"reply": f"The agent is already actively working{' on target: ' + controller.target_module if controller.target_module else ''}!"})
+            b_info = f" (using {controller.preferred_browser.capitalize()})" if controller.preferred_browser != "auto" else ""
+            return jsonify({"reply": f"The agent is already actively working{b_info}{' on target: ' + controller.target_module if controller.target_module else ''}!"})
 
         controller.stop_requested = False
         controller.state = "Starting Automation..."
-        prefix = f"🎯 Target: <strong>{controller.target_module}</strong><br>" if controller.target_module else ""
-        controller.log(f"Received instruction: '{raw_msg}'. Starting autonomous solver...", "info")
+        
+        browser_label = controller.preferred_browser.capitalize() if controller.preferred_browser != "auto" else "Auto-Detected Browser"
+        b_prefix = f"🌐 Browser: <strong>{browser_label}</strong><br>"
+        c_prefix = f"🎯 Target: <strong>{controller.target_module}</strong><br>" if controller.target_module else ""
+        controller.log(f"Received instruction: '{raw_msg}'. Target Browser: {browser_label}. Starting solver...", "info")
 
         t = threading.Thread(target=run_agent_thread, daemon=True)
         controller.running_thread = t
         t.start()
 
         return jsonify({
-            "reply": f"🚀 <strong>Autonomous Agent Started!</strong><br>{prefix}Opening module, scrolling theory topics, clicking Mark As Completed, solving Quizzes & Labs, and advancing through all submodules."
+            "reply": f"🚀 <strong>Autonomous Agent Started!</strong><br>{b_prefix}{c_prefix}Connecting to <strong>{browser_label}</strong>, opening ByteXL, reading topics, solving Quizzes & Labs with Gemini, and advancing through submodules to 100%."
         })
 
     else:
         return jsonify({
-            "reply": f"I received: <em>\"{raw_msg}\"</em>.<br>You can target a specific course (e.g. <code>proceed with system design</code>), or click <strong>'proceed with bytexl'</strong> / <strong>'stop'</strong>."
+            "reply": f"I received: <em>\"{raw_msg}\"</em>.<br>You can say <strong>'proceed with brave browser'</strong>, <strong>'proceed with chrome'</strong>, target a course (e.g. <code>proceed with system design</code>), or click <strong>'proceed with bytexl'</strong>."
         })
 
 if __name__ == "__main__":

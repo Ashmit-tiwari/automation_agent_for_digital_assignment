@@ -119,12 +119,14 @@ def check_cdp_port(port, timeout=0.8):
     except Exception:
         return False, None
 
-def find_active_browser_port(start_port=9222, end_port=9235):
+def find_active_browser_port(start_port=9222, end_port=9235, preferred=None):
     """
     Intelligently scans open browser debugging ports:
-    1. Highest priority: The browser port that currently has a ByteXL tab open!
-    2. Second priority: The browser port with Gemini open.
-    3. Third priority: Any active browser port.
+    1. Highest priority: Browser matching preferred name (e.g. Brave) with ByteXL open.
+    2. Second priority: Browser matching preferred name.
+    3. Third priority: Any browser with ByteXL tab open.
+    4. Fourth priority: Any browser with Gemini open.
+    5. Fallback: First available browser port.
     """
     ports_found = []
     for p in range(start_port, end_port + 1):
@@ -135,17 +137,31 @@ def find_active_browser_port(start_port=9222, end_port=9235):
     if not ports_found:
         return None, None
 
-    # Priority 1: Port with ByteXL tab
+    pref_clean = (preferred or "").lower().strip()
+    if pref_clean and pref_clean != "auto":
+        # 1. Match preferred browser with ByteXL
+        for p, info in ports_found:
+            b = (info.get("browser") or "").lower()
+            if pref_clean in b and info.get("has_bytexl"):
+                return p, info.get("browser", "Chromium")
+
+        # 2. Match preferred browser
+        for p, info in ports_found:
+            b = (info.get("browser") or "").lower()
+            if pref_clean in b:
+                return p, info.get("browser", "Chromium")
+
+    # Priority 3: Port with ByteXL tab
     for p, info in ports_found:
         if info.get("has_bytexl"):
             return p, info.get("browser", "Chromium")
 
-    # Priority 2: Port with Gemini tab
+    # Priority 4: Port with Gemini tab
     for p, info in ports_found:
         if info.get("has_gemini"):
             return p, info.get("browser", "Chromium")
 
-    # Priority 3: First available port
+    # Priority 5: First available port
     return ports_found[0][0], ports_found[0][1].get("browser", "Chromium")
 
 def find_free_port(start_port=9222, max_scan=50):
@@ -243,27 +259,37 @@ class MasterByteXLAgent:
 
     def ensure_browser_running(self):
         """Checks if browser is running with debugging port, or auto-detects/launches it."""
+        pref = getattr(self, "preferred_browser", "auto")
         ok, info = check_cdp_port(self.port, timeout=1.0)
         if ok and info:
             b_name = info.get("browser", "Chromium")
-            print(f"[OK] Browser ({b_name}) is already running on debugging port {self.port}.")
-            if info.get("has_bytexl"):
-                print(f"[🎯] Verified active ByteXL login detected in {b_name} on port {self.port}!")
-            return True
+            if pref == "auto" or pref.lower() in b_name.lower():
+                print(f"[OK] Browser ({b_name}) is already running on debugging port {self.port}.")
+                if info.get("has_bytexl"):
+                    print(f"[🎯] Verified active ByteXL login detected in {b_name} on port {self.port}!")
+                return True
+            else:
+                print(f"[*] Port {self.port} has {b_name}, looking for {pref.upper()}...")
 
-        # Check if browser is running on another common port (prioritizing ByteXL)
-        active_p, active_b = find_active_browser_port(9222, 9235)
+        # Check if browser is running on another common port (prioritizing preferred browser)
+        active_p, active_b = find_active_browser_port(9222, 9235, preferred=pref)
         if active_p:
-            print(f"[*] Auto-detected active browser ({active_b}) on port {active_p}! Switching to port {active_p}...")
-            self.port = active_p
-            return True
+            if pref == "auto" or pref.lower() in active_b.lower():
+                print(f"[*] Detected active browser ({active_b}) on port {active_p}! Switching to port {active_p}...")
+                self.port = active_p
+                return True
 
-        exe = find_installed_browser(self.preferred_browser)
+        if ok and info and pref != "auto" and pref.lower() not in info.get("browser", "").lower():
+            free_p = find_free_port(9223)
+            self.port = free_p
+            print(f"[*] Port 9222 in use by another browser. Using port {self.port} for {pref.capitalize()}...")
+
+        exe = find_installed_browser(pref)
         proc_name = os.path.basename(exe)
         b_label = proc_name.replace(".exe", "").capitalize()
 
         print(f"[*] Launching {b_label} browser with remote debugging on port {self.port}...")
-        launch_browser_on_port(self.port, self.preferred_browser)
+        launch_browser_on_port(self.port, pref)
 
         print(f"[*] Waiting for browser on port {self.port}...")
         for i in range(12):
@@ -293,8 +319,9 @@ class MasterByteXLAgent:
                 await asyncio.sleep(1.0)
 
         # Fallback: scan if browser opened on another port
+        pref = getattr(self, "preferred_browser", "auto")
         if not self.browser:
-            active_p, active_b = find_active_browser_port(9222, 9235)
+            active_p, active_b = find_active_browser_port(9222, 9235, preferred=pref)
             if active_p and active_p != self.port:
                 print(f"[*] Found active browser ({active_b}) on port {active_p}. Auto-connecting...")
                 try:
@@ -1365,6 +1392,7 @@ class MasterByteXLAgent:
                         }
 
                         // Check if checked
+                        const cb = row.querySelector('input[type="checkbox"], .MuiCheckbox-root, [data-testid*="CheckBox"], span[aria-label*="complete"]');
                         const cb = row.querySelector('input[type="checkbox"], .MuiCheckbox-root, [data-testid*="CheckBox"], [data-testid*="Check"], span[aria-label*="complete"]');
                         const isChecked = row.innerHTML.includes('Mui-checked') ||
                                           row.querySelector('[data-testid="CheckBoxIcon"]') !== null ||
@@ -1419,6 +1447,9 @@ class MasterByteXLAgent:
                         await asyncio.sleep(4)
                         continue
 
+                    print("[OK] All Topics, Quizzes and Labs in this module are completed! Returning to My Courses...")
+                    await self.bytexl_page.goto("https://app.bytexl.ai/courses")
+                    await asyncio.sleep(4)
                     if len(self.completed_activities) > 0:
                         print("[OK] All Topics, Quizzes and Labs in this module are completed! Returning to My Courses...")
                         await self.bytexl_page.goto("https://app.bytexl.ai/courses")
@@ -1471,6 +1502,8 @@ class MasterByteXLAgent:
                     await asyncio.sleep(4)
                     continue
                 else:
+                    print("[OK] All courses are 100% completed! Congratulations!")
+                    break
                     has_cards = await self.bytexl_page.evaluate("""() => {
                         return Array.from(document.querySelectorAll('.MuiCard-root, .MuiPaper-root, .MuiBox-root')).some(c => {
                             return c.innerText && (c.innerText.includes('COMPLETION') || c.innerText.includes('Continue learning') || c.innerText.includes('Start learning'));
