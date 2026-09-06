@@ -1314,35 +1314,53 @@ class AutonomousByteXLAgent:
                     pass
 
                 unit_clicked = await self.bytexl_page.evaluate("""() => {
-                    // Look for blue 'Continue Learning' or 'Start Learning' or 'Resume' button
                     const allButtons = Array.from(document.querySelectorAll('button, a'));
-                    const actionBtn = allButtons.find(b => {
+                    
+                    // 1. Prioritize exact blue button "Continue Learning" or "Start Learning"
+                    let targetBtn = allButtons.find(b => {
                         const txt = (b.innerText || '').trim().toLowerCase();
-                        return (txt.includes('continue learning') || txt.includes('start learning') || txt.includes('resume')) &&
-                               !txt.includes('completed');
+                        return (txt === 'continue learning' || txt === 'start learning' || txt === 'resume');
                     });
 
-                    if (actionBtn) {
-                        let container = actionBtn.closest('.MuiPaper-root, .MuiCard-root, .MuiBox-root') || actionBtn.parentElement;
-                        let unitTitle = 'Unit';
-                        if (container) {
-                            const titleEl = container.querySelector('h1, h2, h3, h4, h5, h6');
-                            if (titleEl) unitTitle = titleEl.innerText.trim();
-                            else {
-                                const lines = container.innerText.split('\\n').map(l => l.trim()).filter(Boolean);
-                                if (lines.length > 0) unitTitle = lines[0];
-                            }
-                        }
-                        actionBtn.click();
-                        return unitTitle;
+                    // 2. Fallback: MuiButton-containedPrimary
+                    if (!targetBtn) {
+                        targetBtn = document.querySelector('button.MuiButton-containedPrimary');
                     }
-                    return null;
+
+                    // 3. Fallback: Contains continue learning without completed
+                    if (!targetBtn) {
+                        targetBtn = allButtons.find(b => {
+                            const txt = (b.innerText || '').trim().toLowerCase();
+                            return (txt.includes('continue learning') || txt.includes('start learning')) && !txt.includes('completed');
+                        });
+                    }
+
+                    if (targetBtn) {
+                        let card = targetBtn.closest('.MuiPaper-root, .MuiCard-root, .MuiBox-root, [class*="MuiButton-outlined"]') || targetBtn.parentElement;
+                        let unitTitle = "Unit";
+                        if (card) {
+                            const lines = card.innerText.split('\\n').map(l => l.trim()).filter(Boolean);
+                            const tLine = lines.find(l => !l.toLowerCase().includes('continue learning') && !l.toLowerCase().includes('start learning') && !l.toLowerCase().includes('completed') && !l.toLowerCase().includes('challenge') && !l.toLowerCase().includes('chapter'));
+                            if (tLine) unitTitle = tLine;
+                        }
+                        targetBtn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+                        targetBtn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+                        targetBtn.click();
+                        return { clicked: true, title: unitTitle };
+                    }
+                    return { clicked: false };
                 }""")
 
-                if unit_clicked:
-                    self.ctrl.current_module_name = unit_clicked
-                    self.ctrl.log(f"Clicked 'Continue Learning' on Unit: {unit_clicked}", "success")
-                await asyncio.sleep(4)
+                if unit_clicked.get("clicked"):
+                    self.ctrl.current_module_name = unit_clicked.get("title", "Unit")
+                    self.ctrl.log(f"Clicked 'Continue Learning' on Unit: {unit_clicked.get('title')}", "success")
+                    try:
+                        await self.bytexl_page.wait_for_url(lambda u: "/module/" in u.lower(), timeout=8000)
+                        self.ctrl.log(f"Entered Module view: '{unit_clicked.get('title')}'!", "success")
+                    except Exception:
+                        await asyncio.sleep(4)
+                else:
+                    self.ctrl.log("No uncompleted unit found on current page.", "warn")
 
         # Stage 3: Inside Module view (.../module/...)
         self.ctrl.state = "Processing Module Activities..."

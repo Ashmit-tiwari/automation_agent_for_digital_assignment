@@ -1446,23 +1446,36 @@ class MasterByteXLAgent:
                 print("\n[*] On Units & Chapters page. Finding uncompleted unit with 'Continue Learning'...")
                 unit_res = await self.bytexl_page.evaluate("""() => {
                     const allButtons = Array.from(document.querySelectorAll('button, a'));
-                    const actionBtn = allButtons.find(b => {
+                    
+                    // 1. Exact match for blue button
+                    let actionBtn = allButtons.find(b => {
                         const txt = (b.innerText || '').trim().toLowerCase();
-                        return (txt === 'continue learning' || txt === 'start learning' || txt.includes('continue learning') || txt.includes('start learning')) &&
-                               !txt.includes('completed');
+                        return (txt === 'continue learning' || txt === 'start learning' || txt === 'resume');
                     });
 
+                    // 2. Fallback: MuiButton-containedPrimary
+                    if (!actionBtn) {
+                        actionBtn = document.querySelector('button.MuiButton-containedPrimary');
+                    }
+
+                    // 3. Fallback: contains continue learning without completed
+                    if (!actionBtn) {
+                        actionBtn = allButtons.find(b => {
+                            const txt = (b.innerText || '').trim().toLowerCase();
+                            return (txt.includes('continue learning') || txt.includes('start learning')) && !txt.includes('completed');
+                        });
+                    }
+
                     if (actionBtn) {
-                        let container = actionBtn.closest('.MuiPaper-root, .MuiCard-root, .MuiBox-root') || actionBtn.parentElement;
+                        let card = actionBtn.closest('.MuiPaper-root, .MuiCard-root, .MuiBox-root, [class*="MuiButton-outlined"]') || actionBtn.parentElement;
                         let unitTitle = 'Unit';
-                        if (container) {
-                            const titleEl = container.querySelector('h1, h2, h3, h4, h5, h6');
-                            if (titleEl) unitTitle = titleEl.innerText.trim();
-                            else {
-                                const lines = container.innerText.split('\\n').map(l => l.trim()).filter(Boolean);
-                                if (lines.length > 0) unitTitle = lines[0];
-                            }
+                        if (card) {
+                            const lines = card.innerText.split('\\n').map(l => l.trim()).filter(Boolean);
+                            const tLine = lines.find(l => !l.toLowerCase().includes('continue learning') && !l.toLowerCase().includes('start learning') && !l.toLowerCase().includes('completed') && !l.toLowerCase().includes('challenge') && !l.toLowerCase().includes('chapter'));
+                            if (tLine) unitTitle = tLine;
                         }
+                        actionBtn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+                        actionBtn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
                         actionBtn.click();
                         return { clicked: true, title: unitTitle };
                     }
@@ -1471,7 +1484,11 @@ class MasterByteXLAgent:
 
                 if unit_res.get("clicked"):
                     print(f"[OK] Clicked 'Continue Learning' on: {unit_res.get('title')}")
-                    await asyncio.sleep(4)
+                    try:
+                        await self.bytexl_page.wait_for_url(lambda u: "/module/" in u.lower(), timeout=8000)
+                        print(f"[OK] Entered Module view: '{unit_res.get('title')}'!")
+                    except Exception:
+                        await asyncio.sleep(4)
                     continue
 
             # Check if on Module view / curriculum page
