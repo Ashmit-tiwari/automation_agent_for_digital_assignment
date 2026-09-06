@@ -258,13 +258,12 @@ PAGE_VISIBILITY_SHIM = """
 })();
 """
 
-def launch_browser_on_port(port, preferred=None):
+def launch_browser_on_port(port, preferred=None, use_default_profile=True):
     exe = find_installed_browser(preferred)
-    prof = os.path.expandvars(r"%USERPROFILE%\.bytexl_profile")
     flags = [
-        f'--user-data-dir={prof}',
         f"--remote-debugging-port={port}",
         "--remote-allow-origins=*",
+        "--restore-last-session",
         "--no-first-run",
         "--no-default-browser-check",
         "--disable-background-timer-throttling",
@@ -276,6 +275,10 @@ def launch_browser_on_port(port, preferred=None):
         "https://app.bytexl.ai/courses",
         "https://gemini.google.com/app",
     ]
+    if not use_default_profile:
+        prof = os.path.expandvars(r"%USERPROFILE%\.bytexl_profile")
+        flags.insert(0, f'--user-data-dir={prof}')
+
     flag_str = " ".join(flags)
     try:
         # Launch directly with persistent GUI flags
@@ -336,8 +339,18 @@ class MasterByteXLAgent:
         proc_name = os.path.basename(exe)
         b_label = proc_name.replace(".exe", "").capitalize()
 
-        print(f"[*] Launching {b_label} browser with remote debugging on port {self.port}...")
-        launch_browser_on_port(self.port, pref)
+        # If browser process is running without debugging, gracefully restart it with debugging on default profile
+        if is_browser_process_running(proc_name):
+            print(f"[*] Detected {b_label} is running in standard mode without remote debugging.")
+            print(f"[*] 🔄 Restarting {b_label} with debugging enabled (preserving all open tabs & logins)...")
+            try:
+                subprocess.run(f'taskkill /IM "{proc_name}" /F', shell=True, capture_output=True)
+                time.sleep(2.0)
+            except Exception:
+                pass
+
+        print(f"[*] Launching {b_label} browser with remote debugging on port {self.port} (using your existing profile)...")
+        launch_browser_on_port(self.port, pref, use_default_profile=True)
 
         print(f"[*] Waiting for browser on port {self.port}...")
         for i in range(12):

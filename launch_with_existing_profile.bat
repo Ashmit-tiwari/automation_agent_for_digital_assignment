@@ -10,7 +10,7 @@ echo Port: %PORT%
 echo Mode: Native Default Profile (Uses your existing cookies and logins)
 echo.
 
-set FLAGS=--remote-debugging-port=%PORT% --remote-allow-origins=* --no-first-run --no-default-browser-check --disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-renderer-backgrounding --disable-features=CalculateNativeWinOcclusion,IntensiveWakeUpThrottling,ThrottleDisplayNoneAndVisibilityHiddenCrossOriginIframes --disable-ipc-flooding-protection --disable-hang-monitor
+set FLAGS=--remote-debugging-port=%PORT% --remote-allow-origins=* --restore-last-session --no-first-run --no-default-browser-check --disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-renderer-backgrounding --disable-features=CalculateNativeWinOcclusion,IntensiveWakeUpThrottling,ThrottleDisplayNoneAndVisibilityHiddenCrossOriginIframes --disable-ipc-flooding-protection --disable-hang-monitor
 set URLS=https://app.bytexl.ai/courses https://gemini.google.com/app
 
 :: Auto-detect browser or use preference
@@ -92,17 +92,19 @@ exit /b 1
 :check_running
 echo Selected Browser: %BNAME% (%TARGET_EXE%)
 echo.
-echo NOTE: To enable remote debugging on your existing profile with all your saved logins,
-echo please close any existing open windows of %BNAME% first if they were not launched with debugging.
-echo.
-echo Press any key to launch %BNAME% on port %PORT% with your existing profile...
-pause >nul
+if not "%BROWSER_EXE_NAME%"=="" (
+    echo [*] Closing existing %BNAME% window so remote debugging can attach to your default profile...
+    taskkill /IM "%BROWSER_EXE_NAME%" /F >nul 2>&1
+    timeout /t 2 >nul
+)
 
+echo [*] Launching %BNAME% with remote debugging on port %PORT%...
 start "" "%TARGET_EXE%" %FLAGS% %URLS%
 
 echo.
-echo [?] %BNAME% launched with remote debugging on port %PORT%!
-echo [?] All your existing logins (ByteXL, Gemini, Google) are active!
-echo Now switch back to the ByteXL Agent UI and click "Proceed with ByteXL".
-echo.
-timeout /t 5 >nul
+echo ================================================================
+echo [OK] %BNAME% launched with remote debugging on port %PORT%!
+echo [OK] All your existing logins (ByteXL, Gemini, Google) and open tabs are preserved!
+echo Now switch back to http://localhost:5000 and click "Proceed with %BNAME%".
+echo ================================================================
+timeout /t 4 >nul

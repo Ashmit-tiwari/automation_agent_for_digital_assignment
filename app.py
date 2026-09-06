@@ -262,14 +262,13 @@ PAGE_VISIBILITY_SHIM = """
 })();
 """
 
-def launch_browser_on_port(port, preferred=None):
+def launch_browser_on_port(port, preferred=None, use_default_profile=True):
     pref = preferred or (controller.preferred_browser if 'controller' in globals() else "auto")
     exe = find_installed_browser(pref)
-    prof = os.path.expandvars(r"%USERPROFILE%\.bytexl_profile")
     flags = [
-        f'--user-data-dir={prof}',
         f"--remote-debugging-port={port}",
         "--remote-allow-origins=*",
+        "--restore-last-session",
         "--no-first-run",
         "--no-default-browser-check",
         "--disable-background-timer-throttling",
@@ -281,6 +280,10 @@ def launch_browser_on_port(port, preferred=None):
         "https://app.bytexl.ai/courses",
         "https://gemini.google.com/app",
     ]
+    if not use_default_profile:
+        prof = os.path.expandvars(r"%USERPROFILE%\.bytexl_profile")
+        flags.insert(0, f'--user-data-dir={prof}')
+
     flag_str = " ".join(flags)
     try:
         os.startfile(exe, arguments=flag_str)
@@ -371,8 +374,18 @@ class AutonomousByteXLAgent:
         proc_name = os.path.basename(exe)
         b_label = proc_name.replace(".exe", "").capitalize()
 
-        self.ctrl.log(f"Launching {b_label} with remote debugging on port {target_port}...", "info")
-        launch_browser_on_port(target_port, pref)
+        # If browser is currently running without debugging, gracefully restart it with debugging on the default profile
+        if is_browser_process_running(proc_name):
+            self.ctrl.log(f"Detected {b_label} is running in standard mode without remote debugging.", "info")
+            self.ctrl.log(f"🔄 Restarting {b_label} with debugging enabled (preserving all your open tabs & saved logins)...", "info")
+            try:
+                subprocess.run(f'taskkill /IM "{proc_name}" /F', shell=True, capture_output=True)
+                time.sleep(2.0)
+            except Exception:
+                pass
+
+        self.ctrl.log(f"Launching {b_label} with remote debugging on port {target_port} (using your existing profile)...", "info")
+        launch_browser_on_port(target_port, pref, use_default_profile=True)
 
         self.ctrl.log(f"Waiting for {b_label} on port {target_port}...", "info")
         for i in range(12):
@@ -1849,8 +1862,18 @@ def api_restart_browser():
     req_browser = data.get("browser") or controller.preferred_browser
     exe = find_installed_browser(req_browser)
     proc_name = os.path.basename(exe)
-    controller.log(f"Starting {proc_name} with remote debugging on port {port}...", "info")
-    launch_browser_on_port(port, req_browser)
+
+    # Gracefully terminate running browser so debugging attaches to user's real profile
+    if is_browser_process_running(proc_name):
+        controller.log(f"Closing currently running {proc_name}...", "info")
+        try:
+            subprocess.run(f'taskkill /IM "{proc_name}" /F', shell=True, capture_output=True)
+            time.sleep(2.0)
+        except Exception:
+            pass
+
+    controller.log(f"Starting {proc_name} with remote debugging on port {port} (preserving all logins & tabs)...", "info")
+    launch_browser_on_port(port, req_browser, use_default_profile=True)
     time.sleep(2)
     controller.cdp_port = port
     controller.port_error = False
