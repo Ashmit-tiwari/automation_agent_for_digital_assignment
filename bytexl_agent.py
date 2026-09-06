@@ -1078,14 +1078,38 @@ class MasterByteXLAgent:
             print("[*] The agent is paused and will automatically resume as soon as you log in...")
             while True:
                 await asyncio.sleep(2)
-                still_login = await self.bytexl_page.evaluate("""() => {
-                    const url = window.location.href.toLowerCase();
-                    if (url.includes('/login') || url.includes('/signin')) return true;
-                    return !!document.querySelector('input[type="password"]');
-                }""")
-                if not still_login:
-                    print("[OK] ByteXL login detected! Proceeding to courses...")
+                found_logged_in = None
+                for p in list(self.context.pages):
+                    try:
+                        u = p.url.lower()
+                        if "bytexl" in u:
+                            if "/login" not in u and "/signin" not in u:
+                                has_pass = await p.evaluate("() => !!document.querySelector('input[type=\"password\"]')")
+                                if not has_pass:
+                                    found_logged_in = p
+                                    break
+                    except Exception:
+                        pass
+
+                if found_logged_in:
+                    self.bytexl_page = found_logged_in
+                    print(f"[OK] ByteXL login detected in tab: {found_logged_in.url[:60]}! Proceeding to courses...")
                     await asyncio.sleep(2)
+                    break
+
+                try:
+                    still_login = await self.bytexl_page.evaluate("""() => {
+                        const url = window.location.href.toLowerCase();
+                        if (url.includes('/login') || url.includes('/signin')) return true;
+                        return !!document.querySelector('input[type="password"]');
+                    }""")
+                    if not still_login:
+                        print("[OK] ByteXL login detected! Proceeding to courses...")
+                        await asyncio.sleep(2)
+                        break
+                except Exception:
+                    await asyncio.sleep(2)
+                    print("[OK] ByteXL login redirect detected! Proceeding to courses...")
                     break
 
         # Check Gemini sign-in notice

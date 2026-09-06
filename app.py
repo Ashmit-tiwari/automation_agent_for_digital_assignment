@@ -1055,14 +1055,41 @@ class AutonomousByteXLAgent:
             self.ctrl.log("💡 The agent is paused and will automatically resume as soon as you log in.", "info")
             while not self.ctrl.stop_requested:
                 await asyncio.sleep(2)
-                still_login = await self.bytexl_page.evaluate("""() => {
-                    const url = window.location.href.toLowerCase();
-                    if (url.includes('/login') || url.includes('/signin')) return true;
-                    return !!document.querySelector('input[type="password"]');
-                }""")
-                if not still_login:
-                    self.ctrl.log("✅ ByteXL login detected! Proceeding with course automation...", "success")
+                # 1. Check all open pages in browser to see if any tab is logged into ByteXL
+                found_logged_in = None
+                for p in list(self.context.pages):
+                    try:
+                        u = p.url.lower()
+                        if "bytexl" in u:
+                            if "/login" not in u and "/signin" not in u:
+                                has_pass = await p.evaluate("() => !!document.querySelector('input[type=\"password\"]')")
+                                if not has_pass:
+                                    found_logged_in = p
+                                    break
+                    except Exception:
+                        pass
+
+                if found_logged_in:
+                    self.bytexl_page = found_logged_in
+                    self.ctrl.log(f"✅ ByteXL login detected in tab: {found_logged_in.url[:60]}! Proceeding...", "success")
                     await asyncio.sleep(2)
+                    break
+
+                # 2. Check if current bytexl_page has navigated away from login
+                try:
+                    still_login = await self.bytexl_page.evaluate("""() => {
+                        const url = window.location.href.toLowerCase();
+                        if (url.includes('/login') || url.includes('/signin')) return true;
+                        return !!document.querySelector('input[type="password"]');
+                    }""")
+                    if not still_login:
+                        self.ctrl.log("✅ ByteXL login detected! Proceeding with course automation...", "success")
+                        await asyncio.sleep(2)
+                        break
+                except Exception:
+                    # Page navigated / redirected upon login
+                    await asyncio.sleep(2)
+                    self.ctrl.log("✅ ByteXL login navigation detected! Proceeding...", "success")
                     break
 
         if self.ctrl.stop_requested:
