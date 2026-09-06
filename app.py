@@ -22,26 +22,56 @@ SCREENSHOTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scre
 os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
 
 # Candidates for Chromium-based browsers across common Windows paths
-BROWSER_CANDIDATES = [
-    # Brave
-    r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
-    r"C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe",
-    os.path.expandvars(r"%LOCALAPPDATA%\BraveSoftware\Brave-Browser\Application\brave.exe"),
-    # Google Chrome
-    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-    os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
-    # Microsoft Edge
-    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-    r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-    os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\Edge\Application\msedge.exe"),
-]
+BROWSER_PATHS = {
+    "chrome": [
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+    ],
+    "edge": [
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+        os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\Edge\Application\msedge.exe"),
+    ],
+    "brave": [
+        r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
+        r"C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe",
+        os.path.expandvars(r"%LOCALAPPDATA%\BraveSoftware\Brave-Browser\Application\brave.exe"),
+    ],
+}
 
-def find_installed_browser():
-    for p in BROWSER_CANDIDATES:
+def get_installed_browser_path(b_name):
+    if not b_name:
+        return None
+    for p in BROWSER_PATHS.get(b_name.lower(), []):
         if os.path.exists(p):
             return p
-    return "brave"
+    return None
+
+def find_installed_browser(preferred=None):
+    if preferred and preferred.lower() in BROWSER_PATHS:
+        p = get_installed_browser_path(preferred)
+        if p:
+            return p
+
+    # Auto-detect which browser is currently running on the user's PC
+    # If user or friend is logged into ByteXL in Chrome/Edge/Brave, that browser is running!
+    if is_browser_process_running("chrome.exe"):
+        p = get_installed_browser_path("chrome")
+        if p: return p
+    if is_browser_process_running("msedge.exe"):
+        p = get_installed_browser_path("edge")
+        if p: return p
+    if is_browser_process_running("brave.exe"):
+        p = get_installed_browser_path("brave")
+        if p: return p
+
+    # Fallback to any installed browser
+    for b in ["chrome", "edge", "brave"]:
+        p = get_installed_browser_path(b)
+        if p: return p
+
+    return "chrome"
 
 def check_cdp_port(port, timeout=0.8):
     import urllib.request
@@ -51,16 +81,76 @@ def check_cdp_port(port, timeout=0.8):
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read().decode())
-            return True, data.get("Browser", "Chromium")
+            browser_raw = data.get("Browser", "Chromium")
+
+        b_lower = browser_raw.lower()
+        if "edg" in b_lower:
+            friendly_browser = "Microsoft Edge"
+        elif "brave" in b_lower:
+            friendly_browser = "Brave"
+        elif "chrome" in b_lower:
+            friendly_browser = "Google Chrome"
+        else:
+            friendly_browser = browser_raw
+
+        has_bytexl = False
+        has_gemini = False
+        tabs_list = []
+        try:
+            url_list = f"http://localhost:{port}/json/list"
+            req_list = urllib.request.Request(url_list, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req_list, timeout=timeout) as resp_list:
+                pages = json.loads(resp_list.read().decode())
+                for pg in pages:
+                    u = (pg.get("url") or "").lower()
+                    t = (pg.get("title") or "").lower()
+                    if pg.get("type") == "page":
+                        tabs_list.append(pg.get("title", ""))
+                    if "bytexl" in u or "bytexl" in t:
+                        has_bytexl = True
+                    if "gemini" in u or "gemini" in t:
+                        has_gemini = True
+        except Exception:
+            pass
+
+        info = {
+            "browser": friendly_browser,
+            "has_bytexl": has_bytexl,
+            "has_gemini": has_gemini,
+            "tabs": tabs_list
+        }
+        return True, info
     except Exception:
         return False, None
 
-def find_active_browser_port(start_port=9222, end_port=9230):
+def find_active_browser_port(start_port=9222, end_port=9235):
+    """
+    Intelligently scans open browser debugging ports:
+    1. Highest priority: The browser port that currently has a ByteXL tab open!
+    2. Second priority: The browser port with Gemini open.
+    3. Third priority: Any active browser port.
+    """
+    ports_found = []
     for p in range(start_port, end_port + 1):
-        ok, browser = check_cdp_port(p, timeout=0.3)
-        if ok:
-            return p, browser
-    return None, None
+        ok, info = check_cdp_port(p, timeout=0.3)
+        if ok and info:
+            ports_found.append((p, info))
+
+    if not ports_found:
+        return None, None
+
+    # Priority 1: Port with ByteXL tab
+    for p, info in ports_found:
+        if info.get("has_bytexl"):
+            return p, info.get("browser", "Chromium")
+
+    # Priority 2: Port with Gemini tab
+    for p, info in ports_found:
+        if info.get("has_gemini"):
+            return p, info.get("browser", "Chromium")
+
+    # Priority 3: First available port
+    return ports_found[0][0], ports_found[0][1].get("browser", "Chromium")
 
 def find_free_port(start_port=9222, max_scan=50):
     import socket
@@ -108,8 +198,9 @@ PAGE_VISIBILITY_SHIM = """
 })();
 """
 
-def launch_browser_on_port(port):
-    exe = find_installed_browser()
+def launch_browser_on_port(port, preferred=None):
+    pref = preferred or (controller.preferred_browser if 'controller' in globals() else "auto")
+    exe = find_installed_browser(pref)
     prof = os.path.expandvars(r"%USERPROFILE%\.bytexl_profile")
     flags = [
         f'--user-data-dir={prof}',
@@ -155,6 +246,7 @@ class Controller:
         self.cdp_port = 9222
         self.port_error = False
         self.last_detected_browser = None
+        self.preferred_browser = "auto"
 
     def log(self, text, level="info"):
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -177,34 +269,38 @@ class AutonomousByteXLAgent:
 
     def ensure_browser_running(self):
         target_port = self.ctrl.cdp_port or 9222
-        ok, b_name = check_cdp_port(target_port, timeout=1.0)
-        if ok:
+        ok, info = check_cdp_port(target_port, timeout=1.0)
+        if ok and info:
+            b_name = info.get("browser", "Chromium")
             self.ctrl.last_detected_browser = b_name
             self.ctrl.port_error = False
+            if info.get("has_bytexl"):
+                self.ctrl.log(f"🎯 Found active ByteXL session in {b_name} on port {target_port}!", "success")
             return True
 
-        # Check if browser is running on another common port (e.g. 9222 - 9230)
-        active_port, active_browser = find_active_browser_port(9222, 9230)
+        # Scan other ports (9222 - 9235) prioritizing any browser where ByteXL is open
+        active_port, active_browser = find_active_browser_port(9222, 9235)
         if active_port:
-            self.ctrl.log(f"Auto-detected active browser ({active_browser}) on port {active_port}! Switching to port {active_port}...", "info")
+            self.ctrl.log(f"Auto-detected browser ({active_browser}) on port {active_port}! Switching to port {active_port}...", "success")
             self.ctrl.cdp_port = active_port
             self.ctrl.last_detected_browser = active_browser
             self.ctrl.port_error = False
             return True
 
-        # If not running on port, check if browser is already open without remote debugging
-        exe = find_installed_browser()
+        # If not running on port, launch preferred or auto-detected browser
+        exe = find_installed_browser(self.ctrl.preferred_browser)
         proc_name = os.path.basename(exe)
         b_label = proc_name.replace(".exe", "").capitalize()
 
         self.ctrl.log(f"Launching {b_label} with remote debugging on port {target_port}...", "info")
-        launch_browser_on_port(target_port)
+        launch_browser_on_port(target_port, self.ctrl.preferred_browser)
 
         self.ctrl.log(f"Waiting for browser on port {target_port}...", "info")
         for i in range(12):
             time.sleep(1)
-            ok, b_name = check_cdp_port(target_port, timeout=1.0)
-            if ok:
+            ok, info = check_cdp_port(target_port, timeout=1.0)
+            if ok and info:
+                b_name = info.get("browser", "Chromium")
                 self.ctrl.last_detected_browser = b_name
                 self.ctrl.port_error = False
                 self.ctrl.log(f"Browser ({b_name}) ready on port {target_port}!", "success")
@@ -233,9 +329,9 @@ class AutonomousByteXLAgent:
             except Exception:
                 await asyncio.sleep(1.0)
 
-        # Fallback: scan if browser opened on another port
+        # Fallback: scan if browser opened on another port (prioritizing ByteXL)
         if not self.browser:
-            active_p, active_b = find_active_browser_port(9222, 9230)
+            active_p, active_b = find_active_browser_port(9222, 9235)
             if active_p and active_p != target_port:
                 self.ctrl.log(f"Found active browser ({active_b}) on port {active_p}. Auto-connecting...", "info")
                 try:
@@ -266,13 +362,19 @@ class AutonomousByteXLAgent:
             except Exception:
                 pass
 
-        # Locate existing ByteXL and Gemini pages
+        # Locate existing ByteXL and Gemini pages across ANY domain or title
         for p in pages:
             url_lower = p.url.lower()
-            if "bytexl.ai" in url_lower and not self.bytexl_page:
+            try:
+                title_lower = (await p.title()).lower()
+            except Exception:
+                title_lower = ""
+            if ("bytexl" in url_lower or "bytexl" in title_lower) and not self.bytexl_page:
                 self.bytexl_page = p
-            elif "gemini.google.com" in url_lower and not self.gemini_page:
+                self.ctrl.log(f"Connected to open ByteXL tab: {p.url[:65]}...", "success")
+            elif ("gemini" in url_lower or "gemini" in title_lower) and not self.gemini_page:
                 self.gemini_page = p
+                self.ctrl.log(f"Connected to open Gemini tab: {p.url[:65]}...", "success")
 
         # If ByteXL is not open, open it
         if not self.bytexl_page:
@@ -1326,7 +1428,6 @@ class AutonomousByteXLAgent:
                     }
 
                     // Check if checked
-                    const cb = row.querySelector('input[type="checkbox"], .MuiCheckbox-root, [data-testid*="CheckBox"], span[aria-label*="complete"]');
                     const cb = row.querySelector('input[type="checkbox"], .MuiCheckbox-root, [data-testid*="CheckBox"], [data-testid*="Check"], span[aria-label*="complete"]');
                     const isChecked = row.innerHTML.includes('Mui-checked') ||
                                       row.querySelector('[data-testid="CheckBoxIcon"]') !== null ||
@@ -1414,12 +1515,13 @@ def download_zip():
 def get_status():
     return jsonify({
         "state": controller.state,
-        "recent_logs": controller.logs[-25:],
+        "recent_logs": controller.logs[-20:],
         "pending_report": controller.pending_report,
         "latest_screenshot_timestamp": int(time.time()) if controller.latest_screenshot else None,
         "cdp_port": controller.cdp_port,
         "port_error": controller.port_error,
         "browser": controller.last_detected_browser,
+        "preferred_browser": getattr(controller, "preferred_browser", "auto"),
         "target_module": controller.target_module
     })
 
@@ -1437,24 +1539,45 @@ def set_target():
 @app.route("/api/ports", methods=["GET"])
 def get_ports():
     current = controller.cdp_port or 9222
-    ok, b_name = check_cdp_port(current, timeout=0.8)
+    ok, info = check_cdp_port(current, timeout=0.8)
+    b_name = info.get("browser", "Chromium") if (ok and info) else None
 
-    candidates = [9222, 9223, 9224, 9225, 9226, 9227, 9228, 9229, 9333, 9555]
+    candidates = [9222, 9223, 9224, 9225, 9226, 9227, 9228, 9229, 9230, 9231, 9232, 9233, 9234, 9235]
     active = []
     for p in candidates:
-        is_ok, browser = check_cdp_port(p, timeout=0.25)
-        if is_ok:
-            active.append({"port": p, "browser": browser})
+        is_ok, p_info = check_cdp_port(p, timeout=0.25)
+        if is_ok and p_info:
+            active.append({
+                "port": p,
+                "browser": p_info.get("browser", "Chromium"),
+                "has_bytexl": p_info.get("has_bytexl", False),
+                "has_gemini": p_info.get("has_gemini", False),
+                "tabs": p_info.get("tabs", [])
+            })
+
+    # Sort ports so any port with ByteXL open appears first
+    active.sort(key=lambda x: 0 if x.get("has_bytexl") else (1 if x.get("has_gemini") else 2))
 
     free_p = find_free_port(9222)
     return jsonify({
         "current_port": current,
         "is_current_active": ok,
         "current_browser": b_name,
+        "preferred_browser": getattr(controller, "preferred_browser", "auto"),
         "active_ports": active,
         "recommended_free_port": free_p,
         "port_error": controller.port_error
     })
+
+@app.route("/api/set_browser", methods=["POST"])
+def set_browser():
+    data = request.json or {}
+    pref = (data.get("browser") or "auto").strip().lower()
+    if pref in ["auto", "chrome", "edge", "brave"]:
+        controller.preferred_browser = pref
+        controller.log(f"Preferred browser set to: {pref.upper()}", "info")
+        return jsonify({"success": True, "preferred_browser": pref})
+    return jsonify({"success": False, "error": "Invalid browser"}), 400
 
 @app.route("/api/set_port", methods=["POST"])
 def set_port():
@@ -1472,6 +1595,7 @@ def set_port():
 def api_launch_browser():
     data = request.json or {}
     req_port = data.get("port")
+    req_browser = data.get("browser") or controller.preferred_browser
     if not req_port:
         req_port = find_free_port(controller.cdp_port or 9222)
     else:
@@ -1479,23 +1603,24 @@ def api_launch_browser():
 
     controller.cdp_port = req_port
     controller.port_error = False
-    launch_browser_on_port(req_port)
-    controller.log(f"Launched browser on port {req_port}.", "info")
-    return jsonify({"success": True, "port": req_port})
+    launch_browser_on_port(req_port, req_browser)
+    controller.log(f"Launched browser ({req_browser}) on port {req_port}.", "info")
+    return jsonify({"success": True, "port": req_port, "browser": req_browser})
 
 @app.route("/api/restart_browser", methods=["POST"])
 def api_restart_browser():
     data = request.json or {}
     port = int(data.get("port", controller.cdp_port or 9222))
-    exe = find_installed_browser()
+    req_browser = data.get("browser") or controller.preferred_browser
+    exe = find_installed_browser(req_browser)
     proc_name = os.path.basename(exe)
     controller.log(f"Starting {proc_name} with remote debugging on port {port}...", "info")
-    launch_browser_on_port(port)
+    launch_browser_on_port(port, req_browser)
     time.sleep(2)
     controller.cdp_port = port
     controller.port_error = False
     controller.log(f"Started {proc_name} with remote debugging on port {port}.", "success")
-    return jsonify({"success": True, "port": port})
+    return jsonify({"success": True, "port": port, "browser": req_browser})
 
 @app.route("/api/ack_report", methods=["POST"])
 def ack_report():

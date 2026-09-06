@@ -19,26 +19,55 @@ SCREENSHOTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scre
 os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
 
 # Candidates for Chromium-based browsers across common Windows paths
-BROWSER_CANDIDATES = [
-    # Brave
-    r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
-    r"C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe",
-    os.path.expandvars(r"%LOCALAPPDATA%\BraveSoftware\Brave-Browser\Application\brave.exe"),
-    # Google Chrome
-    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-    os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
-    # Microsoft Edge
-    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-    r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-    os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\Edge\Application\msedge.exe"),
-]
+BROWSER_PATHS = {
+    "chrome": [
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+    ],
+    "edge": [
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+        os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\Edge\Application\msedge.exe"),
+    ],
+    "brave": [
+        r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
+        r"C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe",
+        os.path.expandvars(r"%LOCALAPPDATA%\BraveSoftware\Brave-Browser\Application\brave.exe"),
+    ],
+}
 
-def find_installed_browser():
-    for p in BROWSER_CANDIDATES:
+def get_installed_browser_path(b_name):
+    if not b_name:
+        return None
+    for p in BROWSER_PATHS.get(b_name.lower(), []):
         if os.path.exists(p):
             return p
-    return "brave"
+    return None
+
+def find_installed_browser(preferred=None):
+    if preferred and preferred.lower() in BROWSER_PATHS:
+        p = get_installed_browser_path(preferred)
+        if p:
+            return p
+
+    # Auto-detect which browser is currently running on the user's PC
+    if is_browser_process_running("chrome.exe"):
+        p = get_installed_browser_path("chrome")
+        if p: return p
+    if is_browser_process_running("msedge.exe"):
+        p = get_installed_browser_path("edge")
+        if p: return p
+    if is_browser_process_running("brave.exe"):
+        p = get_installed_browser_path("brave")
+        if p: return p
+
+    # Fallback to any installed browser
+    for b in ["chrome", "edge", "brave"]:
+        p = get_installed_browser_path(b)
+        if p: return p
+
+    return "chrome"
 
 def check_cdp_port(port, timeout=0.8):
     import urllib.request
@@ -48,16 +77,76 @@ def check_cdp_port(port, timeout=0.8):
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read().decode())
-            return True, data.get("Browser", "Chromium")
+            browser_raw = data.get("Browser", "Chromium")
+
+        b_lower = browser_raw.lower()
+        if "edg" in b_lower:
+            friendly_browser = "Microsoft Edge"
+        elif "brave" in b_lower:
+            friendly_browser = "Brave"
+        elif "chrome" in b_lower:
+            friendly_browser = "Google Chrome"
+        else:
+            friendly_browser = browser_raw
+
+        has_bytexl = False
+        has_gemini = False
+        tabs_list = []
+        try:
+            url_list = f"http://localhost:{port}/json/list"
+            req_list = urllib.request.Request(url_list, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req_list, timeout=timeout) as resp_list:
+                pages = json.loads(resp_list.read().decode())
+                for pg in pages:
+                    u = (pg.get("url") or "").lower()
+                    t = (pg.get("title") or "").lower()
+                    if pg.get("type") == "page":
+                        tabs_list.append(pg.get("title", ""))
+                    if "bytexl" in u or "bytexl" in t:
+                        has_bytexl = True
+                    if "gemini" in u or "gemini" in t:
+                        has_gemini = True
+        except Exception:
+            pass
+
+        info = {
+            "browser": friendly_browser,
+            "has_bytexl": has_bytexl,
+            "has_gemini": has_gemini,
+            "tabs": tabs_list
+        }
+        return True, info
     except Exception:
         return False, None
 
-def find_active_browser_port(start_port=9222, end_port=9230):
+def find_active_browser_port(start_port=9222, end_port=9235):
+    """
+    Intelligently scans open browser debugging ports:
+    1. Highest priority: The browser port that currently has a ByteXL tab open!
+    2. Second priority: The browser port with Gemini open.
+    3. Third priority: Any active browser port.
+    """
+    ports_found = []
     for p in range(start_port, end_port + 1):
-        ok, browser = check_cdp_port(p, timeout=0.3)
-        if ok:
-            return p, browser
-    return None, None
+        ok, info = check_cdp_port(p, timeout=0.3)
+        if ok and info:
+            ports_found.append((p, info))
+
+    if not ports_found:
+        return None, None
+
+    # Priority 1: Port with ByteXL tab
+    for p, info in ports_found:
+        if info.get("has_bytexl"):
+            return p, info.get("browser", "Chromium")
+
+    # Priority 2: Port with Gemini tab
+    for p, info in ports_found:
+        if info.get("has_gemini"):
+            return p, info.get("browser", "Chromium")
+
+    # Priority 3: First available port
+    return ports_found[0][0], ports_found[0][1].get("browser", "Chromium")
 
 def find_free_port(start_port=9222, max_scan=50):
     import socket
@@ -105,8 +194,8 @@ PAGE_VISIBILITY_SHIM = """
 })();
 """
 
-def launch_browser_on_port(port):
-    exe = find_installed_browser()
+def launch_browser_on_port(port, preferred=None):
+    exe = find_installed_browser(preferred)
     prof = os.path.expandvars(r"%USERPROFILE%\.bytexl_profile")
     flags = [
         f'--user-data-dir={prof}',
@@ -139,9 +228,10 @@ def launch_browser_on_port(port):
         return True
 
 class MasterByteXLAgent:
-    def __init__(self, port=9222, target=None):
+    def __init__(self, port=9222, target=None, preferred_browser="auto"):
         self.port = port
         self.target = (target or "").strip()
+        self.preferred_browser = preferred_browser
         self.playwright = None
         self.browser = None
         self.context = None
@@ -153,30 +243,34 @@ class MasterByteXLAgent:
 
     def ensure_browser_running(self):
         """Checks if browser is running with debugging port, or auto-detects/launches it."""
-        ok, b_name = check_cdp_port(self.port, timeout=1.0)
-        if ok:
+        ok, info = check_cdp_port(self.port, timeout=1.0)
+        if ok and info:
+            b_name = info.get("browser", "Chromium")
             print(f"[OK] Browser ({b_name}) is already running on debugging port {self.port}.")
+            if info.get("has_bytexl"):
+                print(f"[🎯] Verified active ByteXL login detected in {b_name} on port {self.port}!")
             return True
 
-        # Check if browser is running on another common port
-        active_p, active_b = find_active_browser_port(9222, 9230)
+        # Check if browser is running on another common port (prioritizing ByteXL)
+        active_p, active_b = find_active_browser_port(9222, 9235)
         if active_p:
             print(f"[*] Auto-detected active browser ({active_b}) on port {active_p}! Switching to port {active_p}...")
             self.port = active_p
             return True
 
-        exe = find_installed_browser()
+        exe = find_installed_browser(self.preferred_browser)
         proc_name = os.path.basename(exe)
         b_label = proc_name.replace(".exe", "").capitalize()
 
         print(f"[*] Launching {b_label} browser with remote debugging on port {self.port}...")
-        launch_browser_on_port(self.port)
+        launch_browser_on_port(self.port, self.preferred_browser)
 
         print(f"[*] Waiting for browser on port {self.port}...")
         for i in range(12):
             time.sleep(1)
-            ok, b_name = check_cdp_port(self.port, timeout=1.0)
-            if ok:
+            ok, info = check_cdp_port(self.port, timeout=1.0)
+            if ok and info:
+                b_name = info.get("browser", "Chromium")
                 print(f"[OK] Browser ({b_name}) is ready and listening on port {self.port}!")
                 return True
 
@@ -200,7 +294,7 @@ class MasterByteXLAgent:
 
         # Fallback: scan if browser opened on another port
         if not self.browser:
-            active_p, active_b = find_active_browser_port(9222, 9230)
+            active_p, active_b = find_active_browser_port(9222, 9235)
             if active_p and active_p != self.port:
                 print(f"[*] Found active browser ({active_b}) on port {active_p}. Auto-connecting...")
                 try:
@@ -227,13 +321,19 @@ class MasterByteXLAgent:
             except Exception:
                 pass
 
-        # Locate or open ByteXL and Gemini tabs
+        # Locate existing ByteXL and Gemini pages across ANY domain or title
         for p in pages:
             url_lower = p.url.lower()
-            if "bytexl.ai" in url_lower and not self.bytexl_page:
+            try:
+                title_lower = (await p.title()).lower()
+            except Exception:
+                title_lower = ""
+            if ("bytexl" in url_lower or "bytexl" in title_lower) and not self.bytexl_page:
                 self.bytexl_page = p
-            elif "gemini.google.com" in url_lower and not self.gemini_page:
+                print(f"[🎯] Connected to open ByteXL tab: {p.url[:65]}...")
+            elif ("gemini" in url_lower or "gemini" in title_lower) and not self.gemini_page:
                 self.gemini_page = p
+                print(f"[🎯] Connected to open Gemini tab: {p.url[:65]}...")
 
         if not self.bytexl_page:
             print("[*] Opening ByteXL tab...")

@@ -517,6 +517,16 @@
                     If port 9222 is busy or fails on your friend's PC, choose an option below to proceed:
                 </p>
                 
+                <div style="margin-bottom: 14px;">
+                    <div style="font-size: 11px; font-weight: 600; color: var(--text-muted); margin-bottom: 6px; letter-spacing: 0.5px;">TARGET BROWSER:</div>
+                    <select id="browserPrefSelect" class="chat-input" style="width: 100%; padding: 8px 10px; background: var(--bg-card); color: var(--text-heading); border: 1px solid var(--border-color); border-radius: 6px;" onchange="changeBrowserPref(this.value)">
+                        <option value="auto">🌐 Auto-Detect (Scans Browser with ByteXL Logged In)</option>
+                        <option value="chrome">🟡 Google Chrome</option>
+                        <option value="edge">🔵 Microsoft Edge</option>
+                        <option value="brave">🦁 Brave Browser</option>
+                    </select>
+                </div>
+                
                 <div style="background-color: var(--bg-primary); border: 1px solid var(--border-color); border-radius: 8px; padding: 12px; margin-bottom: 16px;">
                     <div style="font-size: 11px; font-weight: 600; color: var(--text-muted); letter-spacing: 0.5px;">ACTIVE OPEN BROWSERS DETECTED:</div>
                     <div id="activePortsList" class="port-chip-list">
@@ -676,12 +686,18 @@
                 recPort.textContent = data.recommended_free_port;
                 customPortInput.value = data.recommended_free_port;
 
+                if (data.preferred_browser) {
+                    const sel = document.getElementById('browserPrefSelect');
+                    if (sel) sel.value = data.preferred_browser;
+                }
+
                 if (data.active_ports && data.active_ports.length > 0) {
                     activePortsList.innerHTML = '';
                     data.active_ports.forEach(ap => {
                         const chip = document.createElement('div');
                         chip.className = 'port-chip';
-                        chip.innerHTML = `🟢 <strong>Port ${ap.port}</strong> (${ap.browser}) <span style="text-decoration: underline;">Use</span>`;
+                        const bytexlBadge = ap.has_bytexl ? '<span style="background:#238636;color:#fff;padding:2px 7px;border-radius:10px;font-size:10.5px;margin-left:6px;font-weight:600;">🎯 ByteXL Found!</span>' : '';
+                        chip.innerHTML = `🟢 <strong>Port ${ap.port}</strong> (${ap.browser}) ${bytexlBadge} <span style="text-decoration: underline; margin-left: auto;">Use</span>`;
                         chip.onclick = () => selectPortAndProceed(ap.port);
                         activePortsList.appendChild(chip);
                     });
@@ -690,6 +706,19 @@
                 }
             } catch (err) {
                 activePortsList.innerHTML = `<span style="font-size: 12px; color: var(--accent-red);">Scan error: ${err.message}</span>`;
+            }
+        }
+
+        async function changeBrowserPref(pref) {
+            try {
+                await fetch('/api/set_browser', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ browser: pref })
+                });
+                appendMessage('assistant', `🌐 Browser preference set to: <strong>${pref.toUpperCase()}</strong>. It will scan or launch ${pref} automatically.`);
+            } catch (e) {
+                alert('Error updating browser: ' + e.message);
             }
         }
 
@@ -715,10 +744,12 @@
                 const res = await fetch('/api/ports');
                 const data = await res.json();
                 if (data.active_ports && data.active_ports.length > 0) {
-                    const chosen = data.active_ports[0].port;
+                    // Prioritize port where ByteXL was discovered!
+                    const bytexlPort = data.active_ports.find(ap => ap.has_bytexl);
+                    const chosen = bytexlPort ? bytexlPort.port : data.active_ports[0].port;
                     await selectPortAndProceed(chosen);
                 } else {
-                    alert('No open debugging browser detected on ports 9222-9230. Launching a new browser session on free port ' + data.recommended_free_port + '...');
+                    alert('No open debugging browser detected on ports 9222-9235. Launching a new browser session on free port ' + data.recommended_free_port + '...');
                     await launchBrowserOnFreePort();
                 }
             } catch (e) {
