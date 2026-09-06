@@ -73,6 +73,47 @@ def find_installed_browser(preferred=None):
 
     return "chrome"
 
+def get_browser_name_for_port(port):
+    """
+    Identifies the exact browser process listening on the given CDP port (e.g. Brave, Chrome, Edge).
+    Chromium-based Brave returns 'Chrome/...' in /json/version, so process inspection is essential.
+    """
+    try:
+        import psutil
+        for conn in psutil.net_connections(kind='inet'):
+            if conn.laddr and conn.laddr.port == port and conn.pid:
+                try:
+                    p = psutil.Process(conn.pid)
+                    pname = p.name().lower()
+                    if "brave" in pname:
+                        return "Brave"
+                    elif "msedge" in pname or "edge" in pname:
+                        return "Microsoft Edge"
+                    elif "chrome" in pname:
+                        return "Google Chrome"
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    try:
+        import subprocess, re
+        out = subprocess.check_output(f'netstat -ano -p tcp | findstr /R /C:":{port} .*LISTENING"', shell=True, text=True)
+        m = re.search(r'\s+(\d+)\s*$', out.strip())
+        if m:
+            pid = int(m.group(1))
+            task_out = subprocess.check_output(f'tasklist /fi "pid eq {pid}" /fo csv /nh', shell=True, text=True).lower()
+            if "brave" in task_out:
+                return "Brave"
+            elif "msedge" in task_out or "edge" in task_out:
+                return "Microsoft Edge"
+            elif "chrome" in task_out:
+                return "Google Chrome"
+    except Exception:
+        pass
+
+    return None
+
 def check_cdp_port(port, timeout=0.8):
     import urllib.request
     import json
@@ -83,15 +124,20 @@ def check_cdp_port(port, timeout=0.8):
             data = json.loads(resp.read().decode())
             browser_raw = data.get("Browser", "Chromium")
 
-        b_lower = browser_raw.lower()
-        if "edg" in b_lower:
-            friendly_browser = "Microsoft Edge"
-        elif "brave" in b_lower:
-            friendly_browser = "Brave"
-        elif "chrome" in b_lower:
-            friendly_browser = "Google Chrome"
+        # Accurate browser identification by process name
+        detected_browser = get_browser_name_for_port(port)
+        if detected_browser:
+            friendly_browser = detected_browser
         else:
-            friendly_browser = browser_raw
+            b_lower = browser_raw.lower()
+            if "brave" in b_lower:
+                friendly_browser = "Brave"
+            elif "edg" in b_lower:
+                friendly_browser = "Microsoft Edge"
+            elif "chrome" in b_lower:
+                friendly_browser = "Google Chrome"
+            else:
+                friendly_browser = browser_raw
 
         has_bytexl = False
         has_gemini = False
@@ -106,6 +152,8 @@ def check_cdp_port(port, timeout=0.8):
                     t = (pg.get("title") or "").lower()
                     if pg.get("type") == "page":
                         tabs_list.append(pg.get("title", ""))
+                    if "chrome-error://" in u or "chromewebdata" in u:
+                        continue
                     if "bytexl" in u or "bytexl" in t:
                         has_bytexl = True
                     if "gemini" in u or "gemini" in t:
@@ -230,8 +278,8 @@ def launch_browser_on_port(port, preferred=None):
         "--disable-features=CalculateNativeWinOcclusion,IntensiveWakeUpThrottling,ThrottleDisplayNoneAndVisibilityHiddenCrossOriginIframes",
         "--disable-ipc-flooding-protection",
         "--disable-hang-monitor",
-        "https://www.bytexl.app",
-        "https://gemini.google.com",
+        "https://app.bytexl.ai/courses",
+        "https://gemini.google.com/app",
     ]
     flag_str = " ".join(flags)
     try:
@@ -397,6 +445,8 @@ class AutonomousByteXLAgent:
         # Locate existing ByteXL and Gemini pages across ANY domain or title
         for p in pages:
             url_lower = p.url.lower()
+            if "chrome-error://" in url_lower or "chromewebdata" in url_lower:
+                continue
             try:
                 title_lower = (await p.title()).lower()
             except Exception:
@@ -408,11 +458,23 @@ class AutonomousByteXLAgent:
                 self.gemini_page = p
                 self.ctrl.log(f"Connected to open Gemini tab: {p.url[:65]}...", "success")
 
-        # If ByteXL is not open, open it
+        # If ByteXL is not open, reuse an error/blank tab or open a new one
         if not self.bytexl_page:
-            self.ctrl.log("Opening ByteXL (https://app.bytexl.ai/courses)...", "info")
-            self.bytexl_page = await self.context.new_page()
-            await self.bytexl_page.goto("https://app.bytexl.ai/courses")
+            reusable_tab = None
+            for p in pages:
+                u = p.url.lower()
+                if "chrome-error://" in u or "chromewebdata" in u or u in ("about:blank", "chrome://newtab/"):
+                    if p != self.gemini_page:
+                        reusable_tab = p
+                        break
+            if reusable_tab:
+                self.bytexl_page = reusable_tab
+                self.ctrl.log("Navigating tab to ByteXL (https://app.bytexl.ai/courses)...", "info")
+                await self.bytexl_page.goto("https://app.bytexl.ai/courses")
+            else:
+                self.ctrl.log("Opening ByteXL (https://app.bytexl.ai/courses)...", "info")
+                self.bytexl_page = await self.context.new_page()
+                await self.bytexl_page.goto("https://app.bytexl.ai/courses")
             await asyncio.sleep(2)
 
         # Ensure Gemini is open
@@ -1110,152 +1172,164 @@ class AutonomousByteXLAgent:
 
         self.ctrl.state = "Navigating Course..."
 
+        # Instant Check: Is an assessment or quiz tab ALREADY open in the browser?
+        already_open_test = None
+        for p in self.context.pages:
+            u = p.url.lower()
+            if "/test/" in u or "/assessment/" in u:
+                already_open_test = p
+                break
+        if not already_open_test and self.bytexl_page:
+            u = self.bytexl_page.url.lower()
+            if "/test/" in u or "/assessment/" in u:
+                already_open_test = self.bytexl_page
+
+        skip_course_navigation = False
+        if already_open_test:
+            self.ctrl.log(f"🎯 Active Quiz/Assessment already open in browser ({already_open_test.url[:60]}...). Solving directly!", "success")
+            skip_course_navigation = True
+
         target_course = (self.ctrl.target_module or "").strip()
 
-        # If a specific target course/module was specified (e.g. "System Design" or "Cloud Security")
-        if target_course:
-            # Check if browser is already inside the targeted course
-            already_inside = await self.bytexl_page.evaluate("""(target) => {
-                const pageText = (document.body ? document.body.innerText : '').toLowerCase();
-                const t = target.toLowerCase();
-                const isCourseUrl = window.location.href.includes('/courses/') || window.location.href.includes('/module/');
-                return isCourseUrl && pageText.includes(t);
-            }""", target_course)
-
-            if already_inside:
-                self.ctrl.log(f"🎯 Already inside target course: '{target_course}'! Continuing directly...", "success")
-            else:
-                self.ctrl.log(f"🎯 Target course specified: '{target_course}'. Searching in 'My Courses'...", "info")
-                curr_url = self.bytexl_page.url.lower()
-                if not curr_url.rstrip("/").endswith("/courses"):
-                    try:
-                        await self.bytexl_page.goto("https://app.bytexl.ai/courses")
-                        await asyncio.sleep(3)
-                    except Exception:
-                        pass
-
-                try:
-                    search_input = await self.bytexl_page.wait_for_selector('input[placeholder*="search" i]', timeout=6000)
-                    if search_input:
-                        await search_input.fill("")
-                        await search_input.fill(target_course)
-                        await self.bytexl_page.keyboard.press("Enter")
-                        await asyncio.sleep(2.5)
-                except Exception as e:
-                    self.ctrl.log(f"Search input interaction: {e}", "warn")
-
-                found_card = await self.bytexl_page.evaluate("""(target) => {
-                    const tLower = target.toLowerCase();
-                    const cards = Array.from(document.querySelectorAll('.MuiPaper-root, .MuiCard-root, .MuiBox-root')).filter(c => {
-                        const txt = (c.innerText || '').toLowerCase();
-                        return (txt.includes('completion') || txt.includes('continue learning') || txt.includes('start learning') || txt.includes('resume')) && txt.includes(tLower);
-                    });
-                    if (cards.length > 0) {
-                        const card = cards[0];
-                        const btn = Array.from(card.querySelectorAll('button, a')).find(b => {
-                            const txt = (b.innerText || '').toLowerCase();
-                            return txt.includes('continue learning') || txt.includes('start learning') || txt.includes('resume');
-                        }) || card.querySelector('button, a') || card;
-                        btn.click();
-                        return true;
-                    }
-                    return false;
+        if not skip_course_navigation:
+            # If a specific target course/module was specified (e.g. "System Design" or "Cloud Security")
+            if target_course:
+                # Check if browser is already inside the targeted course
+                already_inside = await self.bytexl_page.evaluate("""(target) => {
+                    const pageText = (document.body ? document.body.innerText : '').toLowerCase();
+                    const t = target.toLowerCase();
+                    const isCourseUrl = window.location.href.includes('/courses/') || window.location.href.includes('/module/');
+                    return isCourseUrl && pageText.includes(t);
                 }""", target_course)
 
-                if found_card:
-                    self.ctrl.log(f"Opened target course: '{target_course}'!", "success")
-                    await asyncio.sleep(4)
+                if already_inside:
+                    self.ctrl.log(f"🎯 Already inside target course: '{target_course}'! Continuing directly...", "success")
                 else:
-                    self.ctrl.log(f"Target '{target_course}' search finished. Continuing with active course...", "info")
+                    self.ctrl.log(f"🎯 Target course specified: '{target_course}'. Searching in 'My Courses'...", "info")
+                    curr_url = self.bytexl_page.url.lower()
+                    if not curr_url.rstrip("/").endswith("/courses"):
+                        try:
+                            await self.bytexl_page.goto("https://app.bytexl.ai/courses")
+                            await asyncio.sleep(3)
+                        except Exception:
+                            pass
 
-            if found_card:
-                self.ctrl.log(f"Opened target course: '{target_course}'!", "success")
-                await asyncio.sleep(4)
-            else:
-                self.ctrl.log(f"Target '{target_course}' search finished. Continuing with active course...", "info")
+                    try:
+                        search_input = await self.bytexl_page.wait_for_selector('input[placeholder*="search" i]', timeout=6000)
+                        if search_input:
+                            await search_input.fill("")
+                            await search_input.fill(target_course)
+                            await self.bytexl_page.keyboard.press("Enter")
+                            await asyncio.sleep(2.5)
+                    except Exception as e:
+                        self.ctrl.log(f"Search input interaction: {e}", "warn")
 
-        # Stage 1 (Fallback / default if on /courses): click course card with < 100% completion
-        curr_url = self.bytexl_page.url.lower()
-        if curr_url.rstrip("/").endswith("/courses"):
-            self.ctrl.log("Scanning 'My Courses' for uncompleted courses (< 100%)...", "info")
-            try:
-                await self.bytexl_page.bring_to_front()
-            except Exception:
-                pass
+                    found_card = await self.bytexl_page.evaluate("""(target) => {
+                        const tLower = target.toLowerCase();
+                        const cards = Array.from(document.querySelectorAll('.MuiPaper-root, .MuiCard-root, .MuiBox-root')).filter(c => {
+                            const txt = (c.innerText || '').toLowerCase();
+                            return (txt.includes('completion') || txt.includes('continue learning') || txt.includes('start learning') || txt.includes('resume')) && txt.includes(tLower);
+                        });
+                        if (cards.length > 0) {
+                            const card = cards[0];
+                            const btn = Array.from(card.querySelectorAll('button, a')).find(b => {
+                                const txt = (b.innerText || '').toLowerCase();
+                                return txt.includes('continue learning') || txt.includes('start learning') || txt.includes('resume');
+                            }) || card.querySelector('button, a') || card;
+                            btn.click();
+                            return true;
+                        }
+                        return false;
+                    }""", target_course)
 
-            target_idx = await self.bytexl_page.evaluate("""() => {
-                const btnList = Array.from(document.querySelectorAll('button, a')).filter(b => {
-                    const txt = (b.innerText || '').toLowerCase();
-                    return txt.includes('continue learning') || txt.includes('start learning') || txt.includes('resume');
-                });
-                for (let idx = 0; idx < btnList.length; idx++) {
-                    const btn = btnList[idx];
-                    let p = btn;
-                    for (let i = 0; i < 7; i++) {
-                        if (!p.parentElement) break;
-                        p = p.parentElement;
-                        const txt = p.innerText || '';
-                        if (txt.includes('Course completion') || txt.includes('completion')) {
-                            const pctMatch = txt.match(/(\\d+)%\\s*(?:Course\\s*)?completion/i) || txt.match(/completion[\\s\\S]*?(\\d+)%/i);
-                            const pct = pctMatch ? parseInt(pctMatch[1]) : 0;
-                            if (pct < 100) {
-                                return idx;
+                    if found_card:
+                        self.ctrl.log(f"Opened target course: '{target_course}'!", "success")
+                        await asyncio.sleep(4)
+                    else:
+                        self.ctrl.log(f"Target '{target_course}' search finished. Continuing with active course...", "info")
+
+            # Stage 1 (Fallback / default if on /courses): click course card with < 100% completion
+            curr_url = self.bytexl_page.url.lower()
+            if curr_url.rstrip("/").endswith("/courses"):
+                self.ctrl.log("Scanning 'My Courses' for uncompleted courses (< 100%)...", "info")
+                try:
+                    await self.bytexl_page.bring_to_front()
+                except Exception:
+                    pass
+
+                target_idx = await self.bytexl_page.evaluate("""() => {
+                    const btnList = Array.from(document.querySelectorAll('button, a')).filter(b => {
+                        const txt = (b.innerText || '').toLowerCase();
+                        return txt.includes('continue learning') || txt.includes('start learning') || txt.includes('resume');
+                    });
+                    for (let idx = 0; idx < btnList.length; idx++) {
+                        const btn = btnList[idx];
+                        let p = btn;
+                        for (let i = 0; i < 7; i++) {
+                            if (!p.parentElement) break;
+                            p = p.parentElement;
+                            const txt = p.innerText || '';
+                            if (txt.includes('Course completion') || txt.includes('completion')) {
+                                const pctMatch = txt.match(/(\\d+)%\\s*(?:Course\\s*)?completion/i) || txt.match(/completion[\\s\\S]*?(\\d+)%/i);
+                                const pct = pctMatch ? parseInt(pctMatch[1]) : 0;
+                                if (pct < 100) {
+                                    return idx;
+                                }
                             }
                         }
                     }
-                }
-                return 0;
-            }""")
+                    return 0;
+                }""")
 
-            self.ctrl.log(f"Entering Course (button index {target_idx})...", "info")
-            await self.bytexl_page.evaluate("""(idx) => {
-                const btnList = Array.from(document.querySelectorAll('button, a')).filter(b => {
-                    const txt = (b.innerText || '').toLowerCase();
-                    return txt.includes('continue learning') || txt.includes('start learning') || txt.includes('resume');
-                });
-                if (btnList[idx]) btnList[idx].click();
-            }""", target_idx)
-            await asyncio.sleep(4)
+                self.ctrl.log(f"Entering Course (button index {target_idx})...", "info")
+                await self.bytexl_page.evaluate("""(idx) => {
+                    const btnList = Array.from(document.querySelectorAll('button, a')).filter(b => {
+                        const txt = (b.innerText || '').toLowerCase();
+                        return txt.includes('continue learning') || txt.includes('start learning') || txt.includes('resume');
+                    });
+                    if (btnList[idx]) btnList[idx].click();
+                }""", target_idx)
+                await asyncio.sleep(4)
 
-        # Stage 2: If on course units list (Units and Chapters page: /courses/<id>/<slug>)
-        curr_url = self.bytexl_page.url.lower()
-        if "/courses/" in curr_url and "/module/" not in curr_url:
-            self.ctrl.log("Units & Chapters page detected. Finding uncompleted unit...", "info")
-            try:
-                await self.bytexl_page.bring_to_front()
-            except Exception:
-                pass
+            # Stage 2: If on course units list (Units and Chapters page: /courses/<id>/<slug>)
+            curr_url = self.bytexl_page.url.lower()
+            if "/courses/" in curr_url and "/module/" not in curr_url:
+                self.ctrl.log("Units & Chapters page detected. Finding uncompleted unit...", "info")
+                try:
+                    await self.bytexl_page.bring_to_front()
+                except Exception:
+                    pass
 
-            unit_clicked = await self.bytexl_page.evaluate("""() => {
-                // Look for blue 'Continue Learning' or 'Start Learning' or 'Resume' button
-                const allButtons = Array.from(document.querySelectorAll('button, a'));
-                const actionBtn = allButtons.find(b => {
-                    const txt = (b.innerText || '').trim().toLowerCase();
-                    return (txt.includes('continue learning') || txt.includes('start learning') || txt.includes('resume')) &&
-                           !txt.includes('completed');
-                });
+                unit_clicked = await self.bytexl_page.evaluate("""() => {
+                    // Look for blue 'Continue Learning' or 'Start Learning' or 'Resume' button
+                    const allButtons = Array.from(document.querySelectorAll('button, a'));
+                    const actionBtn = allButtons.find(b => {
+                        const txt = (b.innerText || '').trim().toLowerCase();
+                        return (txt.includes('continue learning') || txt.includes('start learning') || txt.includes('resume')) &&
+                               !txt.includes('completed');
+                    });
 
-                if (actionBtn) {
-                    let container = actionBtn.closest('.MuiPaper-root, .MuiCard-root, .MuiBox-root') || actionBtn.parentElement;
-                    let unitTitle = 'Unit';
-                    if (container) {
-                        const titleEl = container.querySelector('h1, h2, h3, h4, h5, h6');
-                        if (titleEl) unitTitle = titleEl.innerText.trim();
-                        else {
-                            const lines = container.innerText.split('\\n').map(l => l.trim()).filter(Boolean);
-                            if (lines.length > 0) unitTitle = lines[0];
+                    if (actionBtn) {
+                        let container = actionBtn.closest('.MuiPaper-root, .MuiCard-root, .MuiBox-root') || actionBtn.parentElement;
+                        let unitTitle = 'Unit';
+                        if (container) {
+                            const titleEl = container.querySelector('h1, h2, h3, h4, h5, h6');
+                            if (titleEl) unitTitle = titleEl.innerText.trim();
+                            else {
+                                const lines = container.innerText.split('\\n').map(l => l.trim()).filter(Boolean);
+                                if (lines.length > 0) unitTitle = lines[0];
+                            }
                         }
+                        actionBtn.click();
+                        return unitTitle;
                     }
-                    actionBtn.click();
-                    return unitTitle;
-                }
-                return null;
-            }""")
+                    return null;
+                }""")
 
-            if unit_clicked:
-                self.ctrl.current_module_name = unit_clicked
-                self.ctrl.log(f"Clicked 'Continue Learning' on Unit: {unit_clicked}", "success")
-            await asyncio.sleep(4)
+                if unit_clicked:
+                    self.ctrl.current_module_name = unit_clicked
+                    self.ctrl.log(f"Clicked 'Continue Learning' on Unit: {unit_clicked}", "success")
+                await asyncio.sleep(4)
 
         # Stage 3: Inside Module view (.../module/...)
         self.ctrl.state = "Processing Module Activities..."
@@ -1277,9 +1351,14 @@ class AutonomousByteXLAgent:
             # 2. Check if an assessment / test tab is open
             test_page = None
             for p in self.context.pages:
-                if "/test/" in p.url:
+                u = p.url.lower()
+                if "/test/" in u or "/assessment/" in u:
                     test_page = p
                     break
+            if not test_page and self.bytexl_page:
+                u = self.bytexl_page.url.lower()
+                if "/test/" in u or "/assessment/" in u:
+                    test_page = self.bytexl_page
 
             if test_page:
                 has_editor = await test_page.evaluate("() => !!document.querySelector('.monaco-editor, textarea#code')")
@@ -1292,9 +1371,9 @@ class AutonomousByteXLAgent:
                     completed_set.add(current_activity_name)
                 activities_completed += 1
 
-                # Guarantee test tab is closed
+                # Guarantee test tab is closed if it is a secondary popup tab
                 for p in list(self.context.pages):
-                    if "/test/" in p.url:
+                    if p != self.bytexl_page and ("/test/" in p.url.lower() or "/assessment/" in p.url.lower()):
                         try:
                             await p.close()
                         except Exception:

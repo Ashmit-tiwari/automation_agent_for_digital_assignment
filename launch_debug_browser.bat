@@ -11,7 +11,7 @@ echo ========================================================
 
 set USER_DATA_DIR=%USERPROFILE%\.bytexl_profile
 set FLAGS=--remote-debugging-port=%PORT% --remote-allow-origins=* --user-data-dir="%USER_DATA_DIR%" --no-first-run --no-default-browser-check --disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-renderer-backgrounding --disable-features=CalculateNativeWinOcclusion,IntensiveWakeUpThrottling,ThrottleDisplayNoneAndVisibilityHiddenCrossOriginIframes --disable-ipc-flooding-protection --disable-hang-monitor
-set URLS=https://www.bytexl.app https://gemini.google.com
+set URLS=https://app.bytexl.ai/courses https://gemini.google.com/app
 
 :: 1. If user explicitly specified browser (e.g. chrome, edge, brave)
 if /i "%PREF%"=="chrome" goto :try_chrome

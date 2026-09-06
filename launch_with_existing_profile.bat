@@ -11,7 +11,7 @@ echo Mode: Native Default Profile (Uses your existing cookies and logins)
 echo.
 
 set FLAGS=--remote-debugging-port=%PORT% --remote-allow-origins=* --no-first-run --no-default-browser-check --disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-renderer-backgrounding --disable-features=CalculateNativeWinOcclusion,IntensiveWakeUpThrottling,ThrottleDisplayNoneAndVisibilityHiddenCrossOriginIframes --disable-ipc-flooding-protection --disable-hang-monitor
-set URLS=https://www.bytexl.app https://gemini.google.com
+set URLS=https://app.bytexl.ai/courses https://gemini.google.com/app
 
 :: Auto-detect browser or use preference
 if /i "%PREF%"=="chrome" goto :try_chrome

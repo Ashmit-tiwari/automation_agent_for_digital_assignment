@@ -69,6 +69,47 @@ def find_installed_browser(preferred=None):
 
     return "chrome"
 
+def get_browser_name_for_port(port):
+    """
+    Identifies the exact browser process listening on the given CDP port (e.g. Brave, Chrome, Edge).
+    Chromium-based Brave returns 'Chrome/...' in /json/version, so process inspection is essential.
+    """
+    try:
+        import psutil
+        for conn in psutil.net_connections(kind='inet'):
+            if conn.laddr and conn.laddr.port == port and conn.pid:
+                try:
+                    p = psutil.Process(conn.pid)
+                    pname = p.name().lower()
+                    if "brave" in pname:
+                        return "Brave"
+                    elif "msedge" in pname or "edge" in pname:
+                        return "Microsoft Edge"
+                    elif "chrome" in pname:
+                        return "Google Chrome"
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    try:
+        import subprocess, re
+        out = subprocess.check_output(f'netstat -ano -p tcp | findstr /R /C:":{port} .*LISTENING"', shell=True, text=True)
+        m = re.search(r'\s+(\d+)\s*$', out.strip())
+        if m:
+            pid = int(m.group(1))
+            task_out = subprocess.check_output(f'tasklist /fi "pid eq {pid}" /fo csv /nh', shell=True, text=True).lower()
+            if "brave" in task_out:
+                return "Brave"
+            elif "msedge" in task_out or "edge" in task_out:
+                return "Microsoft Edge"
+            elif "chrome" in task_out:
+                return "Google Chrome"
+    except Exception:
+        pass
+
+    return None
+
 def check_cdp_port(port, timeout=0.8):
     import urllib.request
     import json
@@ -79,15 +120,20 @@ def check_cdp_port(port, timeout=0.8):
             data = json.loads(resp.read().decode())
             browser_raw = data.get("Browser", "Chromium")
 
-        b_lower = browser_raw.lower()
-        if "edg" in b_lower:
-            friendly_browser = "Microsoft Edge"
-        elif "brave" in b_lower:
-            friendly_browser = "Brave"
-        elif "chrome" in b_lower:
-            friendly_browser = "Google Chrome"
+        # Accurate browser identification by process name
+        detected_browser = get_browser_name_for_port(port)
+        if detected_browser:
+            friendly_browser = detected_browser
         else:
-            friendly_browser = browser_raw
+            b_lower = browser_raw.lower()
+            if "brave" in b_lower:
+                friendly_browser = "Brave"
+            elif "edg" in b_lower:
+                friendly_browser = "Microsoft Edge"
+            elif "chrome" in b_lower:
+                friendly_browser = "Google Chrome"
+            else:
+                friendly_browser = browser_raw
 
         has_bytexl = False
         has_gemini = False
@@ -102,6 +148,8 @@ def check_cdp_port(port, timeout=0.8):
                     t = (pg.get("title") or "").lower()
                     if pg.get("type") == "page":
                         tabs_list.append(pg.get("title", ""))
+                    if "chrome-error://" in u or "chromewebdata" in u:
+                        continue
                     if "bytexl" in u or "bytexl" in t:
                         has_bytexl = True
                     if "gemini" in u or "gemini" in t:
@@ -225,8 +273,8 @@ def launch_browser_on_port(port, preferred=None):
         "--disable-features=CalculateNativeWinOcclusion,IntensiveWakeUpThrottling,ThrottleDisplayNoneAndVisibilityHiddenCrossOriginIframes",
         "--disable-ipc-flooding-protection",
         "--disable-hang-monitor",
-        "https://www.bytexl.app",
-        "https://gemini.google.com",
+        "https://app.bytexl.ai/courses",
+        "https://gemini.google.com/app",
     ]
     flag_str = " ".join(flags)
     try:
@@ -351,6 +399,8 @@ class MasterByteXLAgent:
         # Locate existing ByteXL and Gemini pages across ANY domain or title
         for p in pages:
             url_lower = p.url.lower()
+            if "chrome-error://" in url_lower or "chromewebdata" in url_lower:
+                continue
             try:
                 title_lower = (await p.title()).lower()
             except Exception:
@@ -363,9 +413,21 @@ class MasterByteXLAgent:
                 print(f"[🎯] Connected to open Gemini tab: {p.url[:65]}...")
 
         if not self.bytexl_page:
-            print("[*] Opening ByteXL tab...")
-            self.bytexl_page = await self.context.new_page()
-            await self.bytexl_page.goto("https://app.bytexl.ai/courses")
+            reusable_tab = None
+            for p in pages:
+                u = p.url.lower()
+                if "chrome-error://" in u or "chromewebdata" in u or u in ("about:blank", "chrome://newtab/"):
+                    if p != self.gemini_page:
+                        reusable_tab = p
+                        break
+            if reusable_tab:
+                self.bytexl_page = reusable_tab
+                print("[*] Navigating tab to ByteXL (https://app.bytexl.ai/courses)...")
+                await self.bytexl_page.goto("https://app.bytexl.ai/courses")
+            else:
+                print("[*] Opening ByteXL tab...")
+                self.bytexl_page = await self.context.new_page()
+                await self.bytexl_page.goto("https://app.bytexl.ai/courses")
             await asyncio.sleep(2)
 
         if not self.gemini_page:
@@ -1123,8 +1185,22 @@ class MasterByteXLAgent:
         except Exception:
             pass
 
-        # If target course/module is specified, search and open it first
-        if self.target:
+        # Instant Check: Is an assessment or quiz tab ALREADY open in the browser?
+        already_open_test = None
+        for p in self.context.pages:
+            u = p.url.lower()
+            if "/test/" in u or "/assessment/" in u:
+                already_open_test = p
+                break
+        if not already_open_test and self.bytexl_page:
+            u = self.bytexl_page.url.lower()
+            if "/test/" in u or "/assessment/" in u:
+                already_open_test = self.bytexl_page
+
+        if already_open_test:
+            print(f"[🎯] Active Quiz/Assessment already open in browser ({already_open_test.url[:60]}...). Solving directly!")
+        elif self.target:
+            # If target course/module is specified, search and open it first
             already_inside = await self.bytexl_page.evaluate("""(target) => {
                 const pageText = (document.body ? document.body.innerText : '').toLowerCase();
                 const t = target.toLowerCase();
@@ -1179,9 +1255,14 @@ class MasterByteXLAgent:
             # Check open pages for any active Test / Quiz / Lab
             test_page = None
             for p in self.context.pages:
-                if "/test/" in p.url:
+                u = p.url.lower()
+                if "/test/" in u or "/assessment/" in u:
                     test_page = p
                     break
+            if not test_page and self.bytexl_page:
+                u = self.bytexl_page.url.lower()
+                if "/test/" in u or "/assessment/" in u:
+                    test_page = self.bytexl_page
 
             if test_page:
                 has_editor = await test_page.evaluate("() => !!document.querySelector('.monaco-editor, textarea#code')")
@@ -1190,9 +1271,9 @@ class MasterByteXLAgent:
                 else:
                     await self.solve_mcq_test(test_page)
 
-                # Close test page or return to module
+                # Close test page if it is a secondary popup window
                 for p in list(self.context.pages):
-                    if "/test/" in p.url:
+                    if p != self.bytexl_page and ("/test/" in p.url.lower() or "/assessment/" in p.url.lower()):
                         try:
                             await p.close()
                         except Exception:
@@ -1416,7 +1497,6 @@ class MasterByteXLAgent:
                         }
 
                         // Check if checked
-                        const cb = row.querySelector('input[type="checkbox"], .MuiCheckbox-root, [data-testid*="CheckBox"], span[aria-label*="complete"]');
                         const cb = row.querySelector('input[type="checkbox"], .MuiCheckbox-root, [data-testid*="CheckBox"], [data-testid*="Check"], span[aria-label*="complete"]');
                         const isChecked = row.innerHTML.includes('Mui-checked') ||
                                           row.querySelector('[data-testid="CheckBoxIcon"]') !== null ||
