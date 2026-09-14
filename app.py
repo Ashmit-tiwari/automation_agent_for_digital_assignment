@@ -1328,7 +1328,7 @@ class AutonomousByteXLAgent:
                     unit_clicked = await self.bytexl_page.evaluate("""() => {
                         const allButtons = Array.from(document.querySelectorAll('button, a'));
                         
-                        // 1. Prioritize exact blue button "Continue Learning" or "Start Learning"
+                        // 1. Prioritize exact blue button 'Continue Learning' or 'Start Learning'
                         let targetBtn = allButtons.find(b => {
                             const txt = (b.innerText || '').trim().toLowerCase();
                             return (txt === 'continue learning' || txt === 'start learning' || txt === 'resume');
@@ -1349,9 +1349,9 @@ class AutonomousByteXLAgent:
 
                         if (targetBtn) {
                             let card = targetBtn.closest('.MuiPaper-root, .MuiCard-root, .MuiBox-root, [class*="MuiButton-outlined"]') || targetBtn.parentElement;
-                            let unitTitle = "Unit";
+                            let unitTitle = 'Unit';
                             if (card) {
-                                const lines = card.innerText.split('\\n').map(l => l.trim()).filter(Boolean);
+                                const lines = card.innerText.split('\n').map(l => l.trim()).filter(Boolean);
                                 const tLine = lines.find(l => !l.toLowerCase().includes('continue learning') && !l.toLowerCase().includes('start learning') && !l.toLowerCase().includes('completed') && !l.toLowerCase().includes('challenge') && !l.toLowerCase().includes('chapter'));
                                 if (tLine) unitTitle = tLine;
                             }
