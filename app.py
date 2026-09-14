@@ -1325,43 +1325,50 @@ class AutonomousByteXLAgent:
                     except Exception:
                         pass
 
-                    unit_clicked = await self.bytexl_page.evaluate("""() => {
-                        const allButtons = Array.from(document.querySelectorAll('button, a'));
-                        
-                        // 1. Prioritize exact blue button 'Continue Learning' or 'Start Learning'
-                        let targetBtn = allButtons.find(b => {
-                            const txt = (b.innerText || '').trim().toLowerCase();
-                            return (txt === 'continue learning' || txt === 'start learning' || txt === 'resume');
-                        });
-
-                        // 2. Fallback: MuiButton-containedPrimary
-                        if (!targetBtn) {
-                            targetBtn = document.querySelector('button.MuiButton-containedPrimary');
-                        }
-
-                        // 3. Fallback: contains continue learning without completed
-                        if (!targetBtn) {
-                            targetBtn = allButtons.find(b => {
+                    try:
+                        unit_clicked = await self.bytexl_page.evaluate("""() => {
+                            const allButtons = Array.from(document.querySelectorAll('button, a'));
+                            
+                            // 1. Prioritize exact blue button 'Continue Learning' or 'Start Learning' or 'Resume'
+                            let targetBtn = allButtons.find(b => {
                                 const txt = (b.innerText || '').trim().toLowerCase();
-                                return (txt.includes('continue learning') || txt.includes('start learning')) && !txt.includes('completed');
+                                return (txt === 'continue learning' || txt === 'start learning' || txt === 'resume' || txt === 'resume my journey');
                             });
-                        }
 
-                        if (targetBtn) {
-                            let card = targetBtn.closest('.MuiPaper-root, .MuiCard-root, .MuiBox-root, [class*="MuiButton-outlined"]') || targetBtn.parentElement;
-                            let unitTitle = 'Unit';
-                            if (card) {
-                                const lines = card.innerText.split('\n').map(l => l.trim()).filter(Boolean);
-                                const tLine = lines.find(l => !l.toLowerCase().includes('continue learning') && !l.toLowerCase().includes('start learning') && !l.toLowerCase().includes('completed') && !l.toLowerCase().includes('challenge') && !l.toLowerCase().includes('chapter'));
-                                if (tLine) unitTitle = tLine;
+                            // 2. Fallback: MuiButton-containedPrimary that is not completed
+                            if (!targetBtn) {
+                                targetBtn = Array.from(document.querySelectorAll('button.MuiButton-containedPrimary')).find(b => {
+                                    const txt = (b.innerText || '').trim().toLowerCase();
+                                    return !txt.includes('completed');
+                                });
                             }
-                            targetBtn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-                            targetBtn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
-                            targetBtn.click();
-                            return { clicked: true, title: unitTitle };
-                        }
-                        return { clicked: false };
-                    }""")
+
+                            // 3. Fallback: contains continue learning / start learning / resume without completed
+                            if (!targetBtn) {
+                                targetBtn = allButtons.find(b => {
+                                    const txt = (b.innerText || '').trim().toLowerCase();
+                                    return (txt.includes('continue learning') || txt.includes('start learning') || txt.includes('resume')) && !txt.includes('completed');
+                                });
+                            }
+
+                            if (targetBtn) {
+                                let card = targetBtn.closest('.MuiPaper-root, .MuiCard-root, .MuiBox-root, [class*="MuiButton-outlined"]') || targetBtn.parentElement;
+                                let unitTitle = 'Unit';
+                                if (card) {
+                                    const lines = card.innerText.split(/\\r?\\n/).map(l => l.trim()).filter(Boolean);
+                                    const tLine = lines.find(l => !l.toLowerCase().includes('continue learning') && !l.toLowerCase().includes('start learning') && !l.toLowerCase().includes('completed') && !l.toLowerCase().includes('challenge') && !l.toLowerCase().includes('chapter'));
+                                    if (tLine) unitTitle = tLine;
+                                }
+                                targetBtn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+                                targetBtn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+                                targetBtn.click();
+                                return { clicked: true, title: unitTitle };
+                            }
+                            return { clicked: false };
+                        }""")
+                    except Exception as e:
+                        self.ctrl.log(f"Error during unit evaluation: {e}", "warn")
+                        unit_clicked = {"clicked": False}
 
                     if unit_clicked.get("clicked"):
                         self.ctrl.current_module_name = unit_clicked.get("title", "Unit")
