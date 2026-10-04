@@ -334,13 +334,17 @@ class GeminiBrain:
             "Our goal is to complete all course units, reading materials, quizzes, and labs to reach 100% completion.\n\n"
             f"Current URL: {current_url}\n"
             f"Page Title: {page_title}\n"
-            f"Visible Headings: {headings[:10]}\n"
-            f"Visible Buttons/Links: {visible_buttons[:25]}\n\n"
+            f"Visible Headings: {headings[:12]}\n"
+            f"Visible Buttons/Links: {visible_buttons[:30]}\n\n"
             "INSTRUCTIONS:\n"
-            "Analyze the page and return ONLY a valid JSON object deciding the next best action:\n"
+            "Analyze the page and determine the next best step to advance progress towards 100%.\n"
+            "- If all units/topics on the screen have 'Completed' badges (100%), set action to 'all_completed'.\n"
+            "- If there is an uncompleted unit card with 'Continue Learning', 'Start Learning', or 'Resume', set action to 'click_button' and target_button_text to that text.\n"
+            "- If there is an uncompleted reading, quiz, or challenge, select it.\n"
+            "Return ONLY a valid JSON object in this exact format with no markdown blocks:\n"
             "{\n"
-            '  "page_type": "course_catalog" | "units_list" | "curriculum_module" | "reading_topic" | "quiz_landing" | "coding_lab",\n'
-            '  "action": "click_button" | "expand_accordion" | "mark_complete" | "advance_unit" | "solve_quiz" | "solve_lab",\n'
+            '  "page_type": "course_catalog" | "units_list" | "curriculum_module" | "reading_topic" | "quiz_landing" | "coding_lab" | "all_done",\n'
+            '  "action": "click_button" | "expand_accordion" | "mark_complete" | "advance_unit" | "solve_quiz" | "solve_lab" | "all_completed",\n'
             '  "target_button_text": "Exact text of the button or item to click",\n'
             '  "reason": "Clear 1-sentence rationale"\n'
             "}"
