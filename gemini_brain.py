@@ -13,13 +13,20 @@ import urllib.error
 from typing import Optional, Dict, Any, List
 
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
-DEFAULT_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+DEFAULT_MODELS = [
+    "gemini-flash-latest",
+    "gemini-3.8-flash",
+    "gemini-flash-lite-latest",
+    "gemini-2.5-flash",
+    "gemini-1.5-flash"
+]
 
 
 class GeminiBrain:
     def __init__(self, api_key: Optional[str] = None):
         self.api_key = api_key or self._load_key()
         self.active_model = DEFAULT_MODELS[0]
+        self._discovered_models: List[str] = []
 
     def _load_key(self) -> str:
         # 1. Environment variable
@@ -71,29 +78,73 @@ class GeminiBrain:
     def has_key(self) -> bool:
         return bool(self.api_key and len(self.api_key) > 10)
 
+    def _discover_models(self) -> List[str]:
+        """Queries Google API to dynamically discover all models that support generateContent."""
+        if not self.has_key():
+            return []
+        url = f"https://generativelanguage.googleapis.com/v1beta/models?key={self.api_key}&pageSize=50"
+        try:
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                models = []
+                for m in data.get("models", []):
+                    if "generateContent" in m.get("supportedGenerationMethods", []):
+                        name = m.get("name", "").replace("models/", "")
+                        models.append(name)
+                # Prioritize flash models
+                flash_models = [m for m in models if "flash" in m.lower() and "tts" not in m.lower() and "image" not in m.lower()]
+                other_models = [m for m in models if m not in flash_models]
+                self._discovered_models = flash_models + other_models
+                return self._discovered_models
+        except Exception:
+            return []
+
+    def get_candidate_models(self) -> List[str]:
+        candidates = [self.active_model]
+        for m in DEFAULT_MODELS:
+            if m not in candidates:
+                candidates.append(m)
+        for m in self._discovered_models:
+            if m not in candidates:
+                candidates.append(m)
+        return candidates
+
     def test_connection(self) -> Dict[str, Any]:
         """Tests the API key by pinging the Gemini models."""
         if not self.has_key():
             return {"success": False, "error": "No API key configured."}
 
-        for model in DEFAULT_MODELS:
+        models_to_test = self.get_candidate_models()
+        tried_discover = False
+
+        while models_to_test:
+            model = models_to_test.pop(0)
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={self.api_key}"
             payload = {
                 "contents": [{"parts": [{"text": "Reply with only the word OK"}]}],
-                "generationConfig": {"temperature": 0.0, "maxOutputTokens": 10}
+                "generationConfig": {"temperature": 0.0, "maxOutputTokens": 250}
             }
             try:
                 data = json.dumps(payload).encode("utf-8")
                 req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
                 with urllib.request.urlopen(req, timeout=12) as response:
                     resp_json = json.loads(response.read().decode("utf-8"))
-                    text = resp_json["candidates"][0]["content"]["parts"][0]["text"].strip()
-                    self.active_model = model
-                    return {"success": True, "model": model, "response": text}
+                    candidates = resp_json.get("candidates", [])
+                    if not candidates:
+                        continue
+                    parts = candidates[0].get("content", {}).get("parts", [])
+                    text = "".join(p.get("text", "") for p in parts).strip()
+                    if text:
+                        self.active_model = model
+                        return {"success": True, "model": model, "response": text}
             except urllib.error.HTTPError as e:
                 err_body = e.read().decode("utf-8", errors="ignore")
-                # If model not found or unsupported, try next model
                 if e.code == 404:
+                    if not tried_discover and not models_to_test:
+                        tried_discover = True
+                        discovered = self._discover_models()
+                        models_to_test.extend([d for d in discovered if d not in DEFAULT_MODELS])
                     continue
                 return {"success": False, "error": f"HTTP {e.code}: {err_body}"}
             except Exception as e:
@@ -102,7 +153,7 @@ class GeminiBrain:
         return {"success": False, "error": "None of the candidate Gemini models responded."}
 
     def _call_api(self, contents: List[Dict[str, Any]], system_instruction: Optional[str] = None,
-                  temperature: float = 0.2, max_tokens: int = 2048) -> str:
+                  temperature: float = 0.2, max_tokens: int = 4096) -> str:
         """Core call to the Google Generative Language REST API."""
         if not self.has_key():
             raise ValueError("Gemini API key is not configured. Please enter your key in settings.")
@@ -120,23 +171,32 @@ class GeminiBrain:
             }
 
         last_error = None
-        models_to_try = [self.active_model] + [m for m in DEFAULT_MODELS if m != self.active_model]
+        models_to_try = self.get_candidate_models()
+        tried_discover = False
 
-        for model in models_to_try:
+        while models_to_try:
+            model = models_to_try.pop(0)
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={self.api_key}"
             try:
                 data = json.dumps(payload).encode("utf-8")
                 req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
                 with urllib.request.urlopen(req, timeout=25) as response:
                     resp_json = json.loads(response.read().decode("utf-8"))
-                    parts = resp_json["candidates"][0]["content"]["parts"]
+                    candidates = resp_json.get("candidates", [])
+                    if not candidates:
+                        continue
+                    parts = candidates[0].get("content", {}).get("parts", [])
                     text = "".join(p.get("text", "") for p in parts)
                     self.active_model = model
                     return text.strip()
             except urllib.error.HTTPError as e:
                 err_text = e.read().decode("utf-8", errors="ignore")
                 last_error = f"HTTP {e.code}: {err_text}"
-                if e.code in (404, 400) and "not found" in err_text.lower():
+                if e.code in (404, 400) and ("not found" in err_text.lower() or "not available" in err_text.lower()):
+                    if not tried_discover and not models_to_try:
+                        tried_discover = True
+                        discovered = self._discover_models()
+                        models_to_try.extend([d for d in discovered if d not in DEFAULT_MODELS])
                     continue
                 break
             except Exception as e:
