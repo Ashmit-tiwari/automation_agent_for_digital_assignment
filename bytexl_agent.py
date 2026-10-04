@@ -6,6 +6,7 @@ import sys
 import time
 from datetime import datetime
 from playwright.async_api import async_playwright
+from gemini_brain import brain
 
 # Ensure utf-8 output encoding on Windows console
 if sys.platform == "win32":
@@ -443,20 +444,25 @@ class MasterByteXLAgent:
                 await self.bytexl_page.goto("https://app.bytexl.ai/courses")
             await asyncio.sleep(2)
 
-        if not self.gemini_page:
-            print("[*] Opening Gemini tab...")
-            self.gemini_page = await self.context.new_page()
-            await self.gemini_page.goto("https://gemini.google.com/app")
-            await asyncio.sleep(2)
+        if brain.has_key():
+            print(f"[OK] ⚡ Brain AI Active: Using direct Gemini API ({brain.active_model}) - 0 extra tabs needed!")
+        else:
+            if not self.gemini_page:
+                print("[*] Opening Gemini tab (tip: add API key in config.json to skip browser tab)...")
+                self.gemini_page = await self.context.new_page()
+                await self.gemini_page.goto("https://gemini.google.com/app")
+                await asyncio.sleep(2)
 
         try:
             await self.bytexl_page.evaluate(PAGE_VISIBILITY_SHIM)
-            await self.gemini_page.evaluate(PAGE_VISIBILITY_SHIM)
+            if self.gemini_page:
+                await self.gemini_page.evaluate(PAGE_VISIBILITY_SHIM)
         except Exception:
             pass
 
         print(f"[OK] ByteXL Tab: {self.bytexl_page.url}")
-        print(f"[OK] Gemini Tab: {self.gemini_page.url}")
+        if self.gemini_page:
+            print(f"[OK] Gemini Tab: {self.gemini_page.url}")
         return True
 
     async def take_screenshot(self, label: str) -> str:
@@ -491,9 +497,25 @@ class MasterByteXLAgent:
 
         return filepath
 
-    async def ask_gemini(self, prompt: str) -> str:
+    async def ask_gemini(self, prompt: str, screenshot_bytes: Optional[bytes] = None) -> str:
         """Sends prompt to Gemini and retrieves the clean response."""
-        print(f"\n[*] Querying Gemini ({len(prompt)} chars)...")
+        if brain.has_key():
+            print(f"\n[*] ⚡ Brain AI Query ({len(prompt)} chars, model={brain.active_model})...")
+            try:
+                if screenshot_bytes:
+                    ans = brain.ask_vision(prompt, screenshot_bytes)
+                else:
+                    ans = brain.ask_text(prompt)
+                print(f"[OK] ⚡ Brain replied in 1s: {ans[:80]}...")
+                return ans
+            except Exception as e:
+                print(f"[WARN] Gemini API error: {e}. Falling back to browser tab...")
+
+        if not self.gemini_page:
+            print("[WARN] No Gemini tab and no API key configured.")
+            return "A"
+
+        print(f"\n[*] Querying Gemini Tab ({len(prompt)} chars)...")
         await self.gemini_page.bring_to_front()
         await asyncio.sleep(0.5)
 
@@ -641,13 +663,25 @@ class MasterByteXLAgent:
                     cleaned = re.sub(r'^[A-Fa-f][\)\.\:\-]\s*', '', opt)
                     formatted_opts.append(f"{lbl}) {cleaned}")
 
-                prompt = f"Question:\n{q_text}\n\nOptions:\n" + "\n".join(formatted_opts) + "\n\nReply with only the correct option letter (example: B) and a short reason."
-                reply = await self.ask_gemini(prompt)
+                opt_idx = 0
+                selected_letter = "A"
 
-                match = re.search(r'\b([A-D])\b', reply)
-                selected_letter = match.group(1) if match else "A"
-                opt_idx = ord(selected_letter) - ord('A')
-                print(f"[OK] Selected: {selected_letter}")
+                if brain.has_key():
+                    try:
+                        shot_bytes = await test_page.screenshot(type="jpeg", quality=85)
+                    except Exception:
+                        shot_bytes = None
+                    sol = brain.solve_mcq(q_text, options, screenshot_bytes=shot_bytes)
+                    selected_letter = sol.get("selected_option", "A")
+                    opt_idx = sol.get("option_index", 0)
+                    print(f"[OK] ⚡ Brain Solution: Option {selected_letter} - {sol.get('explanation', '')[:80]}")
+                else:
+                    prompt = f"Question:\n{q_text}\n\nOptions:\n" + "\n".join(formatted_opts) + "\n\nReply with only the correct option letter (example: B) and a short reason."
+                    reply = await self.ask_gemini(prompt)
+                    match = re.search(r'\b([A-D])\b', reply)
+                    selected_letter = match.group(1) if match else "A"
+                    opt_idx = ord(selected_letter) - ord('A')
+                    print(f"[OK] Selected: {selected_letter}")
 
                 await test_page.evaluate("""(idx) => {
                     const labels = Array.from(document.querySelectorAll('[role="radiogroup"] label, .MuiRadioGroup-root label'));
@@ -843,7 +877,11 @@ class MasterByteXLAgent:
 
             for attempt in range(1, 4):
                 print(f"[*] --- Attempt {attempt}/3 ---")
-                answer = await self.ask_gemini(prompt)
+                try:
+                    shot_bytes = await test_page.screenshot(type="jpeg", quality=85)
+                except Exception:
+                    shot_bytes = None
+                answer = await self.ask_gemini(prompt, screenshot_bytes=shot_bytes)
 
                 # Strip markdown syntax and language identifier
                 clean_code = answer

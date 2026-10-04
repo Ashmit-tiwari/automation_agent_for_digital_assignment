@@ -475,6 +475,9 @@
             <div class="brand-title">ByteXL Copilot</div>
         </div>
         <div style="display: flex; align-items: center; gap: 12px;">
+            <button onclick="openBrainModal()" id="brainStatusBtn" style="background-color: rgba(188, 140, 255, 0.15); border: 1px solid rgba(188, 140, 255, 0.3); color: var(--accent-purple); padding: 5px 12px; border-radius: 6px; font-size: 12px; cursor: pointer; display: flex; align-items: center; gap: 6px; font-weight: 500;" title="Configure Google Gemini Free API Key">
+                🧠 AI Brain: <strong id="brainStatusText" style="color: #fff;">Setup Key</strong>
+            </button>
             <button onclick="openPortModal()" style="background-color: var(--bg-card); border: 1px solid var(--border-color); color: var(--text-heading); padding: 5px 12px; border-radius: 6px; font-size: 12px; cursor: pointer; display: flex; align-items: center; gap: 6px;" title="Click to change port or auto-detect">
                 🔌 Port: <strong id="portDisplay" style="color: var(--accent-blue);">9222</strong>
             </button>
@@ -555,6 +558,56 @@
                         <input type="number" id="customPortInput" class="chat-input" placeholder="e.g. 9223" style="flex: 1;" value="9223">
                         <button class="btn-action btn-proceed" onclick="applyCustomPort()">Proceed with Port</button>
                     </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Gemini AI Brain Configuration Modal -->
+    <div class="modal-overlay" id="brainModal" style="display: none;">
+        <div class="modal-card">
+            <div class="modal-header">
+                <div class="modal-title">
+                    <span>🧠 Google Gemini AI Brain Setup</span>
+                </div>
+                <button class="modal-close" onclick="closeBrainModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p style="margin-bottom: 14px; font-size: 13.5px; color: var(--text-main); line-height: 1.5;">
+                    Add your <strong>Google Free API Key</strong> to unlock <strong>1-second solving</strong>, <strong>multimodal vision</strong> (solving MCQs with diagrams & math formulas), and <strong>zero extra browser tabs</strong>!
+                </p>
+                
+                <div style="margin-bottom: 14px;">
+                    <div style="font-size: 11px; font-weight: 600; color: var(--text-muted); margin-bottom: 6px; letter-spacing: 0.5px;">YOUR GOOGLE GEMINI API KEY:</div>
+                    <div style="display: flex; gap: 8px;">
+                        <input type="password" id="geminiApiKeyInput" class="chat-input" placeholder="AIzaSy..." style="flex: 1; padding: 10px; font-family: 'JetBrains Mono', monospace; font-size: 12.5px;">
+                        <button class="btn-action" style="padding: 10px 14px; background: var(--bg-card); color: var(--text-heading); border: 1px solid var(--border-color); cursor: pointer;" onclick="toggleKeyVisibility()" title="Show/Hide Key">👁️</button>
+                    </div>
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 6px;">
+                        <a href="https://aistudio.google.com/app/apikey" target="_blank" style="color: var(--accent-blue); font-size: 11.5px; text-decoration: none; font-weight: 500;">
+                            🔗 Get your free key from Google AI Studio &rarr;
+                        </a>
+                        <span id="keyValidationMsg" style="font-size: 11.5px; font-weight: 600;"></span>
+                    </div>
+                </div>
+
+                <div style="background-color: var(--bg-primary); border: 1px solid var(--border-color); border-radius: 8px; padding: 12px; margin-bottom: 16px;">
+                    <div style="font-size: 11px; font-weight: 600; color: var(--text-muted); letter-spacing: 0.5px; margin-bottom: 6px;">BENEFITS OF DIRECT API MODE:</div>
+                    <div style="font-size: 12px; color: var(--text-main); line-height: 1.6;">
+                        ⚡ <strong>Ultra-Fast:</strong> Solves 10-question quizzes in 15 seconds instead of 3 minutes<br>
+                        👁️ <strong>Multimodal Vision:</strong> Understands charts, SQL diagrams, and equations<br>
+                        🚫 <strong>Zero Tab Burden:</strong> No need to keep gemini.google.com open or signed in<br>
+                        🛡️ <strong>Self-Healing:</strong> AI perceives page state and navigates without breaking
+                    </div>
+                </div>
+
+                <div style="display: flex; gap: 10px;">
+                    <button class="btn-action btn-proceed" style="flex: 1; padding: 10px; display: flex; align-items: center; justify-content: center; gap: 8px; font-weight: 600;" id="saveKeyBtn" onclick="saveApiKey()">
+                        💾 Save & Activate API Key
+                    </button>
+                    <button class="btn-action" style="padding: 10px 16px; background-color: var(--bg-card); border: 1px solid var(--border-color); color: var(--text-heading); cursor: pointer;" onclick="testApiKey()">
+                        🧪 Test Key
+                    </button>
                 </div>
             </div>
         </div>
@@ -679,6 +732,88 @@
 
         function closePortModal() {
             portModal.style.display = 'none';
+        }
+
+        const brainModal = document.getElementById('brainModal');
+        const geminiApiKeyInput = document.getElementById('geminiApiKeyInput');
+        const keyValidationMsg = document.getElementById('keyValidationMsg');
+
+        async function openBrainModal() {
+            brainModal.style.display = 'flex';
+            keyValidationMsg.textContent = '';
+            try {
+                const res = await fetch('/api/key_status');
+                const data = await res.json();
+                if (data.has_key && data.masked_key) {
+                    geminiApiKeyInput.placeholder = 'Configured: ' + data.masked_key;
+                    keyValidationMsg.style.color = 'var(--accent-green)';
+                    keyValidationMsg.textContent = 'Active: ' + data.model;
+                } else {
+                    geminiApiKeyInput.placeholder = 'AIzaSy...';
+                }
+            } catch (e) {}
+        }
+
+        function closeBrainModal() {
+            brainModal.style.display = 'none';
+        }
+
+        function toggleKeyVisibility() {
+            geminiApiKeyInput.type = geminiApiKeyInput.type === 'password' ? 'text' : 'password';
+        }
+
+        async function saveApiKey() {
+            const key = geminiApiKeyInput.value.trim();
+            if (!key) {
+                alert('Please enter your Google Gemini API Key.');
+                return;
+            }
+            keyValidationMsg.style.color = 'var(--accent-blue)';
+            keyValidationMsg.textContent = 'Validating key with Google AI...';
+            try {
+                const res = await fetch('/api/save_key', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ api_key: key })
+                });
+                const data = await res.json();
+                if (data.success) {
+                    keyValidationMsg.style.color = 'var(--accent-green)';
+                    keyValidationMsg.textContent = '✅ ' + data.message;
+                    appendMessage('assistant', `🧠 <strong>Google Gemini API Key Activated!</strong><br>Connected to <code>${data.model}</code>. Quiz solving will now run with 1s speed and multimodal vision!`);
+                    setTimeout(closeBrainModal, 1200);
+                } else {
+                    keyValidationMsg.style.color = 'var(--accent-red)';
+                    keyValidationMsg.textContent = '❌ ' + (data.error || 'Invalid key');
+                }
+            } catch (e) {
+                keyValidationMsg.style.color = 'var(--accent-red)';
+                keyValidationMsg.textContent = '❌ Error: ' + e.message;
+            }
+        }
+
+        async function testApiKey() {
+            const key = geminiApiKeyInput.value.trim();
+            keyValidationMsg.style.color = 'var(--accent-blue)';
+            keyValidationMsg.textContent = 'Testing connection...';
+            try {
+                const res = await fetch('/api/test_key', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ api_key: key })
+                });
+                const data = await res.json();
+                if (data.success) {
+                    keyValidationMsg.style.color = 'var(--accent-green)';
+                    keyValidationMsg.textContent = '✅ Connected to ' + data.model;
+                } else {
+                    keyValidationMsg.style.color = 'var(--accent-red)';
+                    keyValidationMsg.textContent = '❌ ' + (data.error || 'Failed');
+                }
+            } catch (e) {
+                keyValidationMsg.style.color = 'var(--accent-red)';
+                keyValidationMsg.textContent = '❌ Error: ' + e.message;
+            }
         }
 
         async function refreshPortsInfo() {
@@ -862,6 +997,24 @@
                 document.getElementById('agentStatusText').textContent = data.state;
                 if (data.cdp_port) {
                     portDisplay.textContent = data.cdp_port;
+                }
+
+                // Update AI Brain status button
+                const brainStatusBtn = document.getElementById('brainStatusBtn');
+                const brainStatusText = document.getElementById('brainStatusText');
+                if (brainStatusBtn && brainStatusText) {
+                    if (data.brain_active) {
+                        const mName = data.brain_model ? data.brain_model.replace('gemini-', '') : 'Active';
+                        brainStatusText.textContent = mName;
+                        brainStatusBtn.style.backgroundColor = 'rgba(63, 185, 80, 0.15)';
+                        brainStatusBtn.style.borderColor = 'rgba(63, 185, 80, 0.4)';
+                        brainStatusBtn.style.color = 'var(--accent-green)';
+                    } else {
+                        brainStatusText.textContent = 'Setup Key';
+                        brainStatusBtn.style.backgroundColor = 'rgba(188, 140, 255, 0.15)';
+                        brainStatusBtn.style.borderColor = 'rgba(188, 140, 255, 0.4)';
+                        brainStatusBtn.style.color = 'var(--accent-purple)';
+                    }
                 }
 
                 // Update target module display

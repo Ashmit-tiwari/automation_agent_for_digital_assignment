@@ -8,6 +8,7 @@ ZIP_PATH = os.path.join(BASE_DIR, ZIP_NAME)
 INCLUDE_FILES = [
     "app.py",
     "bytexl_agent.py",
+    "gemini_brain.py",
     "requirements.txt",
     "README.md",
     "start_ui.bat",

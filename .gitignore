@@ -4,3 +4,5 @@ screenshots/
 *.log
 .bytexl_profile/
 *.tmp
+config.json
+.env

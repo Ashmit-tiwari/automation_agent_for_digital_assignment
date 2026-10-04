@@ -9,6 +9,7 @@ import webbrowser
 from datetime import datetime
 from flask import Flask, render_template, request, jsonify, send_file
 from playwright.async_api import async_playwright
+from gemini_brain import brain
 
 # Ensure utf-8 output encoding on Windows console
 if sys.platform == "win32":
@@ -490,21 +491,28 @@ class AutonomousByteXLAgent:
                 await self.bytexl_page.goto("https://app.bytexl.ai/courses")
             await asyncio.sleep(2)
 
-        # Ensure Gemini is open
-        if not self.gemini_page:
-            self.ctrl.log("Opening Google Gemini (https://gemini.google.com/app)...", "info")
-            self.gemini_page = await self.context.new_page()
-            await self.gemini_page.goto("https://gemini.google.com/app")
-            await asyncio.sleep(2)
+        # If Gemini API key is configured, no browser tab is needed!
+        if brain.has_key():
+            self.ctrl.log(f"⚡ Brain AI Active: Connected to Google Gemini API ({brain.active_model}) - 0 extra tabs needed!", "success")
+        else:
+            # Fallback: Open Gemini web tab if no API key configured
+            if not self.gemini_page:
+                self.ctrl.log("Opening Google Gemini (https://gemini.google.com/app)...", "info")
+                self.ctrl.log("💡 Tip: Enter your Google Free API Key in Settings to enable 10x faster solving & vision!", "info")
+                self.gemini_page = await self.context.new_page()
+                await self.gemini_page.goto("https://gemini.google.com/app")
+                await asyncio.sleep(2)
 
         try:
             await self.bytexl_page.evaluate(PAGE_VISIBILITY_SHIM)
-            await self.gemini_page.evaluate(PAGE_VISIBILITY_SHIM)
+            if self.gemini_page:
+                await self.gemini_page.evaluate(PAGE_VISIBILITY_SHIM)
         except Exception:
             pass
 
         self.ctrl.log(f"ByteXL: {self.bytexl_page.url}", "success")
-        self.ctrl.log(f"Gemini: {self.gemini_page.url}", "success")
+        if self.gemini_page:
+            self.ctrl.log(f"Gemini: {self.gemini_page.url}", "success")
         return True
 
     async def take_screenshot(self, label: str) -> str:
@@ -541,8 +549,24 @@ class AutonomousByteXLAgent:
 
         return filepath
 
-    async def ask_gemini(self, prompt: str) -> str:
-        self.ctrl.log(f"Consulting Gemini ({len(prompt)} chars)...", "info")
+    async def ask_gemini(self, prompt: str, screenshot_bytes: Optional[bytes] = None) -> str:
+        if brain.has_key():
+            self.ctrl.log(f"⚡ Brain AI Query ({len(prompt)} chars, model={brain.active_model})...", "info")
+            try:
+                if screenshot_bytes:
+                    ans = brain.ask_vision(prompt, screenshot_bytes)
+                else:
+                    ans = brain.ask_text(prompt)
+                self.ctrl.log(f"⚡ Brain replied in 1s: {ans[:100]}...", "success")
+                return ans
+            except Exception as e:
+                self.ctrl.log(f"⚠️ Gemini API error: {e}. Falling back to browser tab...", "warn")
+
+        if not self.gemini_page:
+            self.ctrl.log("❌ No Gemini tab and no API key configured. Enter your Google Free API key in UI Settings.", "warn")
+            return "A"
+
+        self.ctrl.log(f"Consulting Gemini Tab ({len(prompt)} chars)...", "info")
         await self.gemini_page.bring_to_front()
         await asyncio.sleep(0.5)
 
@@ -666,13 +690,26 @@ class AutonomousByteXLAgent:
                     cleaned = re.sub(r'^[A-Fa-f][\)\.\:\-]\s*', '', opt)
                     formatted_opts.append(f"{lbl}) {cleaned}")
 
-                prompt = f"Question:\n{q_text}\n\nOptions:\n" + "\n".join(formatted_opts) + "\n\nReply with only the correct option letter (example: B) and a short reason."
-                reply = await self.ask_gemini(prompt)
+                opt_idx = 0
+                selected_letter = "A"
 
-                match = re.search(r'\b([A-D])\b', reply)
-                selected_letter = match.group(1) if match else "A"
-                opt_idx = ord(selected_letter) - ord('A')
-                self.ctrl.log(f"Selecting Option {selected_letter} for Q{q_num}", "info")
+                if brain.has_key():
+                    try:
+                        shot_bytes = await test_page.screenshot(type="jpeg", quality=85)
+                    except Exception:
+                        shot_bytes = None
+                    sol = brain.solve_mcq(q_text, options, screenshot_bytes=shot_bytes)
+                    selected_letter = sol.get("selected_option", "A")
+                    opt_idx = sol.get("option_index", 0)
+                    exp = sol.get("explanation", "")
+                    self.ctrl.log(f"⚡ Brain Solution for Q{q_num}: Option {selected_letter} - {exp[:80]}", "success")
+                else:
+                    prompt = f"Question:\n{q_text}\n\nOptions:\n" + "\n".join(formatted_opts) + "\n\nReply with only the correct option letter (example: B) and a short reason."
+                    reply = await self.ask_gemini(prompt)
+                    match = re.search(r'\b([A-D])\b', reply)
+                    selected_letter = match.group(1) if match else "A"
+                    opt_idx = ord(selected_letter) - ord('A')
+                    self.ctrl.log(f"Selecting Option {selected_letter} for Q{q_num}", "info")
 
                 await test_page.evaluate("""(idx) => {
                     const labels = Array.from(document.querySelectorAll('[role="radiogroup"] label, .MuiRadioGroup-root label'));
@@ -879,7 +916,11 @@ class AutonomousByteXLAgent:
                 else:
                     self.ctrl.log(f"Attempt {attempt}/3: Querying Gemini for solution...", "info")
 
-                answer = await self.ask_gemini(prompt)
+                try:
+                    shot_bytes = await test_page.screenshot(type="jpeg", quality=85)
+                except Exception:
+                    shot_bytes = None
+                answer = await self.ask_gemini(prompt, screenshot_bytes=shot_bytes)
 
                 clean_code = answer
                 if "```" in answer:
@@ -1807,8 +1848,56 @@ def get_status():
         "port_error": controller.port_error,
         "browser": controller.last_detected_browser,
         "preferred_browser": getattr(controller, "preferred_browser", "auto"),
-        "target_module": controller.target_module
+        "target_module": controller.target_module,
+        "brain_active": brain.has_key(),
+        "brain_model": brain.active_model
     })
+
+@app.route("/api/save_key", methods=["POST"])
+def save_key():
+    data = request.json or {}
+    key = (data.get("api_key") or "").strip()
+    if not key:
+        return jsonify({"success": False, "error": "API Key cannot be empty."}), 400
+
+    saved = brain.set_api_key(key)
+    if not saved:
+        return jsonify({"success": False, "error": "Failed to save key to config."}), 500
+
+    res = brain.test_connection()
+    if res.get("success"):
+        controller.log(f"🔑 Gemini Free API Key activated! Connected to {res.get('model')} with ~1s latency.", "success")
+        return jsonify({"success": True, "model": res.get("model"), "message": f"Connected to {res.get('model')} successfully!"})
+    else:
+        err = res.get("error", "Key verification failed")
+        controller.log(f"⚠️ Gemini API Key test warning: {err}", "warn")
+        return jsonify({"success": False, "error": err}), 400
+
+@app.route("/api/key_status", methods=["GET"])
+def get_key_status():
+    has_k = brain.has_key()
+    masked = ""
+    if has_k and len(brain.api_key) > 8:
+        masked = brain.api_key[:6] + "..." + brain.api_key[-4:]
+    return jsonify({
+        "has_key": has_k,
+        "model": brain.active_model,
+        "masked_key": masked
+    })
+
+@app.route("/api/test_key", methods=["POST"])
+def test_key():
+    data = request.json or {}
+    temp_key = (data.get("api_key") or "").strip()
+    if temp_key:
+        original = brain.api_key
+        brain.api_key = temp_key
+        res = brain.test_connection()
+        brain.api_key = original
+    else:
+        res = brain.test_connection()
+    return jsonify(res)
+
 
 @app.route("/api/set_target", methods=["POST"])
 def set_target():
