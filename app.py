@@ -881,12 +881,29 @@ class AutonomousByteXLAgent:
         self.ctrl.log("MCQ Quiz finished successfully.", "success")
         await asyncio.sleep(2)
 
-        # Advance if on landing page
-        await self.bytexl_page.evaluate("""() => {
-            const btn = Array.from(document.querySelectorAll('button, a')).find(b => (b.innerText || '').toLowerCase().includes('next unit'));
-            if (btn) btn.click();
-        }""")
-        await asyncio.sleep(2)
+        # Close the test tab if opened separately
+        TEST_CLOSE_KEYS = ['/test/', '/assessment/', '/quiz/', '/lab/', '/challenge/', '/compiler/', '/practice/']
+        for p in list(self.context.pages):
+            try:
+                u = p.url.lower()
+                if any(k in u for k in TEST_CLOSE_KEYS) and p != self.bytexl_page:
+                    await p.close()
+            except Exception:
+                pass
+
+        if self.bytexl_page and not self.bytexl_page.is_closed():
+            try:
+                await self.bytexl_page.bring_to_front()
+            except Exception:
+                pass
+            await asyncio.sleep(1.5)
+
+            # Advance if on landing page
+            await self.bytexl_page.evaluate("""() => {
+                const btn = Array.from(document.querySelectorAll('button, a')).find(b => (b.innerText || '').toLowerCase().includes('next unit'));
+                if (btn) btn.click();
+            }""")
+            await asyncio.sleep(1.5)
         self.ctrl.log("MCQ Quiz finished and tab closed.", "success")
 
     async def prepare_editor_for_code(self, test_page):
@@ -948,7 +965,7 @@ class AutonomousByteXLAgent:
                 const t = el.innerText ? el.innerText.trim() : '';
                 return /^[0-9]+$/.test(t) && parseInt(t) >= 1 && parseInt(t) <= 50 && el.children.length === 0 && (el.className.includes('Typography') || (el.parentElement && el.parentElement.className.includes('MuiBox')));
             });
-            return els.length || 10;
+            return els.length > 0 ? els.length : 1;
         }""")
         self.ctrl.log(f"Lab contains {total_questions} challenges.", "info")
 
@@ -1162,24 +1179,40 @@ class AutonomousByteXLAgent:
         }""")
         await asyncio.sleep(2)
 
-        # Cut (close) the lab tabs
-        self.ctrl.log("Cutting lab tab and moving to next topic...", "info")
-        for p in list(self.context.pages):
-            if "/test/" in p.url:
-                try:
-                    await p.close()
-                except Exception:
-                    pass
-
-        await self.bytexl_page.bring_to_front()
-        await asyncio.sleep(2)
-
-        # Advance if on landing page
-        await self.bytexl_page.evaluate("""() => {
-            const btn = Array.from(document.querySelectorAll('button, a')).find(b => (b.innerText || '').toLowerCase().includes('next unit'));
-            if (btn) btn.click();
+        # Handle any confirmation popup/dialog
+        await test_page.evaluate("""() => {
+            const confirmBtns = Array.from(document.querySelectorAll('.MuiDialog-root button, .MuiModal-root button, [role="dialog"] button, button')).filter(b => {
+                const txt = (b.innerText || '').toLowerCase();
+                return (txt.includes('confirm') || txt.includes('yes') || txt.includes('end test') || txt.includes('submit')) && !b.disabled;
+            });
+            if (confirmBtns.length > 0) confirmBtns[confirmBtns.length - 1].click();
         }""")
         await asyncio.sleep(2)
+
+        # Cut (close) the lab tabs if opened separately
+        self.ctrl.log("Cutting lab tab and moving to next topic...", "info")
+        TEST_CLOSE_KEYS = ['/test/', '/assessment/', '/quiz/', '/lab/', '/challenge/', '/compiler/', '/practice/']
+        for p in list(self.context.pages):
+            try:
+                u = p.url.lower()
+                if any(k in u for k in TEST_CLOSE_KEYS) and p != self.bytexl_page:
+                    await p.close()
+            except Exception:
+                pass
+
+        if self.bytexl_page and not self.bytexl_page.is_closed():
+            try:
+                await self.bytexl_page.bring_to_front()
+            except Exception:
+                pass
+            await asyncio.sleep(1.5)
+
+            # Advance if on landing page
+            await self.bytexl_page.evaluate("""() => {
+                const btn = Array.from(document.querySelectorAll('button, a')).find(b => (b.innerText || '').toLowerCase().includes('next unit'));
+                if (btn) btn.click();
+            }""")
+            await asyncio.sleep(1.5)
         self.ctrl.log("Coding Lab completed and tab closed.", "success")
 
     async def handle_theory_reading(self, page):
@@ -1305,15 +1338,30 @@ class AutonomousByteXLAgent:
         if not valid_pages:
             return self.bytexl_page, "default"
 
-        # 1. Prioritize active quiz / test / assessment (by URL or by DOM)
+        # 1. Prioritize active quiz / test / assessment / lab / challenge (by URL or by DOM)
+        TEST_URL_PATTERNS = ['/test/', '/assessment/', '/quiz/', '/lab/', '/challenge/', '/compiler/', '/practice/', '/code/']
         for p in valid_pages:
             try:
                 u = p.url.lower()
-                if "/test/" in u or "/assessment/" in u or "/quiz/" in u:
-                    return p, "test"
-                has_test_dom = await p.evaluate("() => !!document.querySelector('[role=\"radiogroup\"], .MuiRadioGroup-root, .monaco-editor')")
-                if has_test_dom:
-                    return p, "test"
+                is_test_url = any(k in u for k in TEST_URL_PATTERNS)
+                has_test_dom = await p.evaluate("""() => {
+                    return !!document.querySelector(
+                        '[role="radiogroup"], .MuiRadioGroup-root, [role="radio"], ' +
+                        '.monaco-editor, textarea#code, .test-results, .output-console'
+                    );
+                }""")
+                if is_test_url or has_test_dom:
+                    # Exclude tabs that are already submitted / finished result screens
+                    is_finished = await p.evaluate("""() => {
+                        const bt = (document.body ? document.body.innerText : '').toLowerCase();
+                        const hasRadios = !!document.querySelector('[role="radiogroup"], .MuiRadioGroup-root, [role="radio"]');
+                        const hasMonaco = !!document.querySelector('.monaco-editor, textarea#code');
+                        return (bt.includes('test submitted') || bt.includes('assessment submitted') ||
+                                bt.includes('assessment completed') || bt.includes('quiz completed')) &&
+                               !hasRadios && !hasMonaco;
+                    }""")
+                    if not is_finished:
+                        return p, "test"
             except Exception:
                 pass
 
@@ -1364,15 +1412,30 @@ class AutonomousByteXLAgent:
                 const url = window.location.href.toLowerCase();
                 const bodyText = (document.body ? document.body.innerText : '').toLowerCase();
 
-                // 1. Active Test / Assessment FIRST! (A page with questions/radios is NEVER a login page)
+                // 1. Check if on a finished / submitted test page (results screen)
                 const hasRadios = !!document.querySelector('[role="radiogroup"], .MuiRadioGroup-root, [role="radio"]');
                 const hasMonaco = !!document.querySelector('.monaco-editor, textarea#code');
                 const hasScoreDiff = bodyText.includes('difficulty:') || bodyText.includes('score:') || bodyText.includes('answer submitted');
-                if (url.includes('/test/') || url.includes('/assessment/') || url.includes('/quiz/') || hasRadios || hasMonaco || (hasScoreDiff && hasRadios)) {
-                    return { state: "TEST_ACTIVE", isCoding: hasMonaco, isMCQ: hasRadios };
+                const isTestUrl = url.includes('/test/') || url.includes('/assessment/') || url.includes('/quiz/') ||
+                                  url.includes('/lab/') || url.includes('/challenge/') || url.includes('/compiler/') ||
+                                  url.includes('/practice/') || url.includes('/code/');
+
+                const isFinishedSummary = !hasRadios && !hasMonaco && (
+                    bodyText.includes('test submitted') || bodyText.includes('assessment submitted') ||
+                    bodyText.includes('assessment completed') || bodyText.includes('quiz completed') ||
+                    bodyText.includes('submission successful') ||
+                    (bodyText.includes('your score') && !bodyText.includes('submit'))
+                );
+                if (isTestUrl && isFinishedSummary) {
+                    return { state: "TEST_FINISHED" };
                 }
 
-                // 2. Login required ONLY if on actual login URL or visible login form (and NOT a test)
+                // 2. Active Test / Assessment (Coding or MCQ)
+                if (hasRadios || hasMonaco || isTestUrl || (hasScoreDiff && hasRadios)) {
+                    return { state: "TEST_ACTIVE", isCoding: hasMonaco, isMCQ: hasRadios || !hasMonaco };
+                }
+
+                // 3. Login required ONLY if on actual login URL or visible login form (and NOT a test)
                 const isLoginUrl = url.includes('/login') || url.includes('/signin');
                 const visiblePassword = Array.from(document.querySelectorAll('input[type="password"]')).some(el => {
                     const rect = el.getBoundingClientRect();
@@ -1386,7 +1449,7 @@ class AutonomousByteXLAgent:
                     return { state: "LOGIN" };
                 }
 
-                // 3. Reading / Theory Topic
+                // 4. Reading / Theory Topic
                 const hasMarkBtn = Array.from(document.querySelectorAll('button, a')).some(b => {
                     const t = (b.innerText || '').trim().toLowerCase();
                     return t === 'mark as completed' || t === 'mark as complete' || t === 'mark complete';
@@ -1397,11 +1460,18 @@ class AutonomousByteXLAgent:
                     return { state: "READING_TOPIC", hasMarkBtn: hasMarkBtn };
                 }
 
-                // 4. Quiz / Lab Landing Page (with Start/Take button)
-                const openBtn = Array.from(document.querySelectorAll('button, a')).find(b => {
+                // 5. Quiz / Lab Landing Page (with Start/Take button)
+                const startKeywords = [
+                    'take the quiz', 'take quiz', 'start quiz', 'open quiz', 'attempt quiz',
+                    'start lab', 'open lab', 'resume lab', 'launch lab',
+                    'start assessment', 'take assessment', 'open assessment',
+                    'start challenge', 'open challenge', 'solve challenge',
+                    'start test', 'take test', 'resume test', 'resume quiz',
+                    'continue quiz', 'continue lab', 'continue assessment'
+                ];
+                const openBtn = Array.from(document.querySelectorAll('button, a, [role="button"]')).find(b => {
                     const t = (b.innerText || '').toLowerCase();
-                    return (t.includes('take the quiz') || t.includes('take quiz') || t.includes('start quiz') || 
-                            t.includes('open quiz') || t.includes('start lab') || t.includes('open lab')) && !b.disabled;
+                    return startKeywords.some(kw => t.includes(kw)) && !b.disabled;
                 });
                 if (openBtn) {
                     return { state: "QUIZ_LANDING", btnText: openBtn.innerText.trim() };
@@ -1756,20 +1826,37 @@ class AutonomousByteXLAgent:
                     const accordion = row.closest('.MuiAccordion-root');
                     if (accordion) {
                         const accSummary = accordion.querySelector('.MuiAccordionSummary-root');
-                        if (accSummary && (accSummary.innerText || '').toLowerCase().includes('completed')) {
-                            continue;
+                        if (accSummary) {
+                            const st = (accSummary.innerText || '').toLowerCase();
+                            const frac = st.match(/(\\d+)\\s*(?:\\/|of)\\s*(\\d+)\\s*completed/);
+                            if (frac && parseInt(frac[1]) < parseInt(frac[2])) {
+                                // Submodule has uncompleted items (e.g. 0/3 or 1/3) -> Do not skip!
+                            } else if (frac && parseInt(frac[1]) === parseInt(frac[2]) && parseInt(frac[2]) > 0) {
+                                continue;
+                            }
+                            const pct = st.match(/(\\d+)%\\s*completed/);
+                            if (pct && parseInt(pct[1]) < 100) {
+                                // Submodule is partially complete -> Do not skip!
+                            } else if (pct && parseInt(pct[1]) === 100) {
+                                continue;
+                            }
                         }
                     }
 
                     const cb = row.querySelector('input[type="checkbox"], .MuiCheckbox-root, [data-testid*="CheckBox"], span[aria-label*="complete"]');
                     const hasBlankIcon = row.querySelector('[data-testid="CheckBoxOutlineBlankIcon"]') !== null;
-                    const isChecked = !hasBlankIcon && (
+                    if (hasBlankIcon) {
+                        return {
+                            text: titleLine,
+                            href: row.href || (row.querySelector('a') ? row.querySelector('a').href : null)
+                        };
+                    }
+
+                    const isChecked = (
                         row.innerHTML.includes('Mui-checked') ||
-                        row.querySelector('[data-testid="CheckBoxIcon"]') !== null ||
-                        row.querySelector('[data-testid="CheckCircleIcon"]') !== null ||
+                        row.querySelector('[data-testid="CheckBoxIcon"], [data-testid="CheckCircleIcon"]') !== null ||
                         row.getAttribute('aria-checked') === 'true' ||
                         row.classList.contains('completed') ||
-                        row.innerText.includes('Completed') ||
                         (cb && (cb.checked || cb.getAttribute('aria-label') === 'Mark as incomplete'))
                     );
 
@@ -1904,10 +1991,40 @@ class AutonomousByteXLAgent:
         try:
             return await page.evaluate("""(name) => {
                 const bodyText = (document.body ? document.body.innerText : '').toLowerCase();
-                return bodyText.includes('highest score') ||
-                       bodyText.includes('quiz completed') ||
-                       bodyText.includes('you scored') ||
-                       bodyText.includes('already submitted');
+
+                // If there is an active Start / Take / Attempt button, it is NOT completed!
+                const startKeywords = [
+                    'take the quiz', 'take quiz', 'start quiz', 'open quiz', 'attempt quiz',
+                    'start lab', 'open lab', 'resume lab', 'launch lab',
+                    'start assessment', 'take assessment', 'open assessment',
+                    'start challenge', 'open challenge', 'solve challenge',
+                    'start test', 'take test', 'resume test', 'resume quiz'
+                ];
+                const hasStartBtn = Array.from(document.querySelectorAll('button, a, [role="button"]')).some(b => {
+                    const t = (b.innerText || '').trim().toLowerCase();
+                    return startKeywords.some(kw => t.includes(kw)) && !b.disabled;
+                });
+
+                // If start button is present, we should ALWAYS run the activity!
+                if (hasStartBtn) {
+                    return false;
+                }
+
+                // Check for explicit finished score in an attempts table
+                const hasFinishedState = bodyText.includes('state: finished') || bodyText.includes('status: finished') || bodyText.includes('submitted');
+                const scoreMatch = bodyText.match(/(?:grade|score|marks)\\s*:\\s*(\\d+(?:\\.\\d+)?)\\s*(?:\\/\\s*(\\d+(?:\\.\\d+)?)|%)/i);
+
+                if (hasFinishedState && scoreMatch) {
+                    const scored = parseFloat(scoreMatch[1]);
+                    const maxScore = scoreMatch[2] ? parseFloat(scoreMatch[2]) : 100;
+                    if (scored >= maxScore) {
+                        return true;
+                    }
+                }
+
+                // Explicit completed message without start button
+                return (bodyText.includes('quiz completed') || bodyText.includes('assessment completed') || bodyText.includes('already submitted')) &&
+                       !bodyText.includes('take the quiz') && !bodyText.includes('start lab');
             }""", activity_name)
         except Exception:
             return False
@@ -2000,9 +2117,36 @@ class AutonomousByteXLAgent:
                 await asyncio.sleep(3)
                 continue
 
+            # 1b. TEST_FINISHED State (Results / Submission screen)
+            if current_state == "TEST_FINISHED":
+                self.ctrl.log("Assessment completed. Returning to course module...", "info")
+                if active_page != self.bytexl_page and not active_page.is_closed():
+                    try:
+                        await active_page.close()
+                    except Exception:
+                        pass
+                for p in self.context.pages:
+                    if not p.is_closed() and "bytexl" in p.url.lower():
+                        self.bytexl_page = p
+                        try:
+                            await self.bytexl_page.bring_to_front()
+                        except Exception:
+                            pass
+                        break
+                await asyncio.sleep(2)
+                continue
+
             # 2. TEST_ACTIVE State (MCQ or Coding)
             if current_state == "TEST_ACTIVE":
                 self.ctrl.state = "Solving Assessment with Gemini..."
+                is_separate_tab = (active_page != self.bytexl_page and len(self.context.pages) > 1)
+
+                try:
+                    await active_page.bring_to_front()
+                    await active_page.evaluate(PAGE_VISIBILITY_SHIM)
+                except Exception:
+                    pass
+
                 if state_info.get("isCoding"):
                     await self.solve_coding(active_page)
                 else:
@@ -2012,16 +2156,44 @@ class AutonomousByteXLAgent:
                     completed_set.add(current_activity_name)
                 activities_completed += 1
 
-                # Keep active page reference healthy without force-closing
-                if active_page and not active_page.is_closed():
-                    self.bytexl_page = active_page
+                # If test ran in a separate tab, close it now so agent doesn't get stuck on it
+                if is_separate_tab and not active_page.is_closed():
+                    self.ctrl.log("Closing assessment tab...", "info")
+                    try:
+                        await active_page.close()
+                    except Exception:
+                        pass
+
+                # Locate and focus the main course curriculum page
+                main_course_page = None
+                for p in self.context.pages:
+                    if not p.is_closed():
+                        u = p.url.lower()
+                        if "bytexl" in u and not any(k in u for k in ['/test/', '/assessment/', '/quiz/', '/lab/', '/challenge/', '/compiler/']):
+                            main_course_page = p
+                            break
+                if not main_course_page and self.bytexl_page and not self.bytexl_page.is_closed():
+                    main_course_page = self.bytexl_page
+                elif not main_course_page and self.context.pages:
+                    main_course_page = self.context.pages[0]
+
+                if main_course_page:
+                    self.bytexl_page = main_course_page
+                    try:
+                        await self.bytexl_page.bring_to_front()
+                    except Exception:
+                        pass
+
                 await asyncio.sleep(2)
 
-                course_page, _ = await self.get_active_page()
-                if course_page and current_activity_name:
-                    ticked = await self.tick_completion_checkbox(course_page, current_activity_name)
+                if main_course_page and current_activity_name:
+                    ticked = await self.tick_completion_checkbox(main_course_page, current_activity_name)
                     if ticked:
                         self.ctrl.log(f"✅ Ticked completion box for '{current_activity_name}'!", "success")
+
+                # If test ran on same page, advance if on landing page
+                if not is_separate_tab:
+                    await self.advance_next(self.bytexl_page)
                 continue
 
             # 3. READING_TOPIC State
@@ -2046,8 +2218,38 @@ class AutonomousByteXLAgent:
 
                 btn_text = state_info.get("btnText", "Take The Quiz Now!")
                 self.ctrl.log(f"Launching Activity: '{btn_text}'...", "info")
+                pages_before = set(self.context.pages)
                 await self.click_button_reliably(active_page, btn_text)
-                await asyncio.sleep(4)
+
+                # Auto-detect newly opened assessment tab and bring to front immediately
+                new_test_tab = None
+                for _ in range(12):
+                    await asyncio.sleep(0.5)
+                    diff = set(self.context.pages) - pages_before
+                    if diff:
+                        new_test_tab = list(diff)[0]
+                        break
+                    u = active_page.url.lower()
+                    if any(k in u for k in ['/test/', '/assessment/', '/quiz/', '/lab/', '/challenge/', '/compiler/', '/practice/', '/code/']):
+                        new_test_tab = active_page
+                        break
+
+                if new_test_tab and not new_test_tab.is_closed():
+                    try:
+                        await new_test_tab.wait_for_load_state("domcontentloaded", timeout=6000)
+                    except Exception:
+                        pass
+                    try:
+                        await new_test_tab.bring_to_front()
+                    except Exception:
+                        pass
+                    try:
+                        await new_test_tab.evaluate(PAGE_VISIBILITY_SHIM)
+                    except Exception:
+                        pass
+                    self.ctrl.log(f"Switched focus to assessment tab: {new_test_tab.url[:60]}", "success")
+                else:
+                    await asyncio.sleep(2)
                 continue
 
             # 5. MODULE_CURRICULUM State

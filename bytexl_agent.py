@@ -912,7 +912,7 @@ class MasterByteXLAgent:
                 const t = el.innerText ? el.innerText.trim() : '';
                 return /^[0-9]+$/.test(t) && parseInt(t) >= 1 && parseInt(t) <= 50 && el.children.length === 0 && (el.className.includes('Typography') || (el.parentElement && el.parentElement.className.includes('MuiBox')));
             });
-            return els.length || 10;
+            return els.length > 0 ? els.length : 1;
         }""")
         print(f"[*] Total Lab Questions: {total_questions}")
 
@@ -1352,14 +1352,15 @@ class MasterByteXLAgent:
 
         # Instant Check: Is an assessment or quiz tab ALREADY open in the browser?
         already_open_test = None
+        TEST_URL_KEYS = ['/test/', '/assessment/', '/quiz/', '/lab/', '/challenge/', '/compiler/', '/practice/', '/code/']
         for p in self.context.pages:
             u = p.url.lower()
-            if "/test/" in u or "/assessment/" in u:
+            if any(k in u for k in TEST_URL_KEYS):
                 already_open_test = p
                 break
         if not already_open_test and self.bytexl_page:
             u = self.bytexl_page.url.lower()
-            if "/test/" in u or "/assessment/" in u:
+            if any(k in u for k in TEST_URL_KEYS):
                 already_open_test = self.bytexl_page
 
         if already_open_test:
@@ -1477,29 +1478,75 @@ class MasterByteXLAgent:
                     except Exception:
                         pass
 
+        TEST_KEYS = ['/test/', '/assessment/', '/quiz/', '/lab/', '/challenge/', '/compiler/', '/practice/', '/code/']
         while True:
             # Check open pages for any active Test / Quiz / Lab
             test_page = None
             for p in self.context.pages:
+                if p.is_closed():
+                    continue
                 u = p.url.lower()
-                if "/test/" in u or "/assessment/" in u:
-                    test_page = p
-                    break
-            if not test_page and self.bytexl_page:
+                if any(k in u for k in TEST_KEYS):
+                    is_done = False
+                    try:
+                        is_done = await p.evaluate("""() => {
+                            const bt = (document.body ? document.body.innerText : '').toLowerCase();
+                            const hasRadios = !!document.querySelector('[role="radiogroup"], .MuiRadioGroup-root, [role="radio"]');
+                            const hasMonaco = !!document.querySelector('.monaco-editor, textarea#code');
+                            return (bt.includes('test submitted') || bt.includes('assessment submitted') ||
+                                    bt.includes('assessment completed') || bt.includes('quiz completed')) &&
+                                   !hasRadios && !hasMonaco;
+                        }""")
+                    except Exception:
+                        pass
+                    if not is_done:
+                        test_page = p
+                        break
+
+            if not test_page and self.bytexl_page and not self.bytexl_page.is_closed():
                 u = self.bytexl_page.url.lower()
-                if "/test/" in u or "/assessment/" in u:
+                if any(k in u for k in TEST_KEYS):
                     test_page = self.bytexl_page
 
             if test_page:
+                try:
+                    await test_page.bring_to_front()
+                except Exception:
+                    pass
                 has_editor = await test_page.evaluate("() => !!document.querySelector('.monaco-editor, textarea#code')")
                 if has_editor:
                     await self.solve_coding_lab(test_page)
                 else:
                     await self.solve_mcq_test(test_page)
 
-                # Keep active page reference healthy without force-closing
-                if test_page and not test_page.is_closed():
-                    self.bytexl_page = test_page
+                is_sep = (test_page != self.bytexl_page and len(self.context.pages) > 1)
+                if is_sep and not test_page.is_closed():
+                    print("[*] Closing completed assessment tab...")
+                    try:
+                        await test_page.close()
+                    except Exception:
+                        pass
+
+                # Locate and focus the main course curriculum page
+                main_course_page = None
+                for p in self.context.pages:
+                    if not p.is_closed():
+                        u = p.url.lower()
+                        if "bytexl" in u and not any(k in u for k in TEST_KEYS):
+                            main_course_page = p
+                            break
+                if not main_course_page and self.bytexl_page and not self.bytexl_page.is_closed():
+                    main_course_page = self.bytexl_page
+                elif not main_course_page and self.context.pages:
+                    main_course_page = self.context.pages[0]
+
+                if main_course_page:
+                    self.bytexl_page = main_course_page
+                    try:
+                        await self.bytexl_page.bring_to_front()
+                    except Exception:
+                        pass
+
                 await asyncio.sleep(2)
 
                 # Post-Activity: Tick the side completion box on the sidebar/accordion!
@@ -1520,10 +1567,16 @@ class MasterByteXLAgent:
                 pass
             unit_action = await self.bytexl_page.evaluate("""() => {
                 const btns = Array.from(document.querySelectorAll('button, a'));
+                const startKeywords = [
+                    'take the quiz', 'take quiz', 'start quiz', 'open quiz', 'attempt quiz',
+                    'start lab', 'open lab', 'resume lab', 'launch lab',
+                    'start assessment', 'take assessment', 'open assessment',
+                    'start challenge', 'open challenge', 'solve challenge',
+                    'start test', 'take test', 'resume test', 'resume quiz'
+                ];
                 const openBtn = btns.find(b => {
                     const txt = (b.innerText || '').toLowerCase();
-                    return (txt.includes('open quiz') || txt.includes('take the quiz') || txt.includes('open lab') ||
-                            txt.includes('start lab') || txt.includes('start quiz') || txt.includes('take quiz')) && !b.disabled;
+                    return startKeywords.some(kw => txt.includes(kw)) && !b.disabled;
                 }) || document.querySelector('button.MuiButton-containedPrimary');
                 const nextUnitBtn = btns.find(b => {
                     const txt = (b.innerText || '').toLowerCase();
@@ -1568,10 +1621,9 @@ class MasterByteXLAgent:
                     }
 
                     const bodyText = document.body.innerText.toLowerCase();
-                    const hasCompletedResult = bodyText.includes('highest score') ||
-                                               bodyText.includes('quiz completed') ||
-                                               bodyText.includes('you scored') ||
-                                               bodyText.includes('already submitted');
+                    // Never consider completed just because 'highest score' is in text!
+                    const hasCompletedResult = (bodyText.includes('state: finished') || bodyText.includes('submitted')) &&
+                                               /(?:grade|score|marks)\\s*:\\s*\\d+/i.test(bodyText);
 
                     return {
                         isChecked: isChecked,
@@ -1609,15 +1661,36 @@ class MasterByteXLAgent:
                     await asyncio.sleep(2)
                     continue
 
-                # 3. Assessment is not completed -> launch and solve it!
+                # 3. Assessment is not completed -> launch and switch to it!
                 print(f"[*] Assessment detected. Clicking '{unit_action['openText']}'...")
+                pages_before = set(self.context.pages)
                 await self.bytexl_page.evaluate("""(txt) => {
                     const btns = Array.from(document.querySelectorAll('button, a'));
                     const target = btns.find(b => (b.innerText || '').trim().toLowerCase() === txt.toLowerCase()) ||
                                    document.querySelector('button.MuiButton-containedPrimary');
                     if (target) target.click();
                 }""", unit_action['openText'])
-                await asyncio.sleep(4)
+
+                new_test = None
+                for _ in range(12):
+                    await asyncio.sleep(0.5)
+                    diff = set(self.context.pages) - pages_before
+                    if diff:
+                        new_test = list(diff)[0]
+                        break
+                    u = self.bytexl_page.url.lower()
+                    if any(k in u for k in TEST_KEYS):
+                        new_test = self.bytexl_page
+                        break
+
+                if new_test and not new_test.is_closed():
+                    try:
+                        await new_test.bring_to_front()
+                    except Exception:
+                        pass
+                    print(f"[OK] Switched focus to assessment tab: {new_test.url[:60]}")
+                else:
+                    await asyncio.sleep(2)
                 continue
 
             # Check if on a Theory / Reading Page (contains Mark As Completed / Summarize / /topic/)
@@ -1752,25 +1825,41 @@ class MasterByteXLAgent:
                         // Skip if already in doneList
                         if (doneList.some(d => titleLine.includes(d) || (d && d.includes(titleLine)))) continue;
 
-                        // Skip if parent submodule accordion is marked as "Completed"
                         const accordion = row.closest('.MuiAccordion-root');
                         if (accordion) {
                             const accSummary = accordion.querySelector('.MuiAccordionSummary-root');
-                            if (accSummary && (accSummary.innerText || '').toLowerCase().includes('completed')) {
-                                continue;
+                            if (accSummary) {
+                                const st = (accSummary.innerText || '').toLowerCase();
+                                const frac = st.match(/(\\d+)\\s*(?:\\/|of)\\s*(\\d+)\\s*completed/);
+                                if (frac && parseInt(frac[1]) < parseInt(frac[2])) {
+                                    // Submodule has uncompleted items (e.g. 0/3 or 1/3) -> Do not skip!
+                                } else if (frac && parseInt(frac[1]) === parseInt(frac[2]) && parseInt(frac[2]) > 0) {
+                                    continue;
+                                }
+                                const pct = st.match(/(\\d+)%\\s*completed/);
+                                if (pct && parseInt(pct[1]) < 100) {
+                                    // Submodule is partially complete -> Do not skip!
+                                } else if (pct && parseInt(pct[1]) === 100) {
+                                    continue;
+                                }
                             }
                         }
 
                         // Check if checked
                         const cb = row.querySelector('input[type="checkbox"], .MuiCheckbox-root, [data-testid*="CheckBox"], span[aria-label*="complete"]');
                         const hasBlankIcon = row.querySelector('[data-testid="CheckBoxOutlineBlankIcon"]') !== null;
-                        const isChecked = !hasBlankIcon && (
+                        if (hasBlankIcon) {
+                            return {
+                                text: titleLine,
+                                href: row.href || (row.querySelector('a') ? row.querySelector('a').href : null)
+                            };
+                        }
+
+                        const isChecked = (
                             row.innerHTML.includes('Mui-checked') ||
-                            row.querySelector('[data-testid="CheckBoxIcon"]') !== null ||
-                            row.querySelector('[data-testid="CheckCircleIcon"]') !== null ||
+                            row.querySelector('[data-testid="CheckBoxIcon"], [data-testid="CheckCircleIcon"]') !== null ||
                             row.getAttribute('aria-checked') === 'true' ||
                             row.classList.contains('completed') ||
-                            row.innerText.includes('Completed') ||
                             (cb && (cb.checked || cb.getAttribute('aria-label') === 'Mark as incomplete'))
                         );
 
