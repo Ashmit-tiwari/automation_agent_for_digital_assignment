@@ -15,6 +15,7 @@ INCLUDE_FILES = [
     "run_agent.bat",
     "launch_debug_browser.bat",
     "launch_with_existing_profile.bat",
+    "start_brave_for_agent.bat",
 ]
 
 INCLUDE_DIRS = [

@@ -334,17 +334,13 @@ class GeminiBrain:
             "Our goal is to complete all course units, reading materials, quizzes, and labs to reach 100% completion.\n\n"
             f"Current URL: {current_url}\n"
             f"Page Title: {page_title}\n"
-            f"Visible Headings: {headings[:12]}\n"
-            f"Visible Buttons/Links: {visible_buttons[:30]}\n\n"
+            f"Visible Headings: {headings[:10]}\n"
+            f"Visible Buttons/Links: {visible_buttons[:25]}\n\n"
             "INSTRUCTIONS:\n"
-            "Analyze the page and determine the next best step to advance progress towards 100%.\n"
-            "- If all units/topics on the screen have 'Completed' badges (100%), set action to 'all_completed'.\n"
-            "- If there is an uncompleted unit card with 'Continue Learning', 'Start Learning', or 'Resume', set action to 'click_button' and target_button_text to that text.\n"
-            "- If there is an uncompleted reading, quiz, or challenge, select it.\n"
-            "Return ONLY a valid JSON object in this exact format with no markdown blocks:\n"
+            "Analyze the page and return ONLY a valid JSON object deciding the next best action:\n"
             "{\n"
-            '  "page_type": "course_catalog" | "units_list" | "curriculum_module" | "reading_topic" | "quiz_landing" | "coding_lab" | "all_done",\n'
-            '  "action": "click_button" | "expand_accordion" | "mark_complete" | "advance_unit" | "solve_quiz" | "solve_lab" | "all_completed",\n'
+            '  "page_type": "course_catalog" | "units_list" | "curriculum_module" | "reading_topic" | "quiz_landing" | "coding_lab",\n'
+            '  "action": "click_button" | "expand_accordion" | "mark_complete" | "advance_unit" | "solve_quiz" | "solve_lab",\n'
             '  "target_button_text": "Exact text of the button or item to click",\n'
             '  "reason": "Clear 1-sentence rationale"\n'
             "}"
@@ -370,5 +366,109 @@ class GeminiBrain:
             }
 
 
+    def match_course(self, target_query: str, available_courses: List[str]) -> Optional[str]:
+        """
+        Intelligently resolves a user's course search query (including acronyms like RDBMS/rdms,
+        typos, abbreviations, or partial names) to the exact matching course title from ByteXL.
+        """
+        if not target_query or not available_courses:
+            return None
+
+        q_raw = target_query.strip()
+        q_clean = re.sub(r'[^a-zA-Z0-9\s]', '', q_raw).lower()
+        q_tokens = [t for t in q_clean.split() if t]
+
+        if not q_tokens:
+            return None
+
+        # 1. Fast Dictionary for common engineering course acronyms & aliases
+        ACRONYMS = {
+            "rdbms": ["relational database", "database management", "dbms", "sql", "rdms"],
+            "rdms": ["relational database", "rdbms", "database management", "dbms", "sql"],
+            "dbms": ["database management system", "database", "rdbms", "sql"],
+            "dsa": ["data structures", "algorithms", "data structures and algorithms"],
+            "os": ["operating system", "operating systems"],
+            "cn": ["computer networks", "computer networking", "networking"],
+            "ai": ["artificial intelligence", "genai", "generative ai"],
+            "genai": ["generative ai", "cloud security (genai)", "generative artificial intelligence"],
+            "ml": ["machine learning"],
+            "cloud": ["cloud security", "cloud computing", "aws", "azure"],
+            "900": ["az-900", "az 900", "azure", "cloud security"],
+            "az900": ["az-900", "az 900", "azure"],
+            "oop": ["object oriented", "oops", "java", "c++"],
+            "oops": ["object oriented", "oop", "java", "c++"],
+            "se": ["software engineering"],
+            "toc": ["theory of computation", "automata"],
+            "cd": ["compiler design"],
+            "wt": ["web technologies", "web development"]
+        }
+
+        # 1a. Direct exact or substring match
+        for course in available_courses:
+            c_clean = re.sub(r'[^a-zA-Z0-9\s]', '', course).lower()
+            if q_clean == c_clean or q_clean in c_clean or c_clean in q_clean:
+                return course
+
+        # 1b. Acronym expansion match (e.g. user typed 'rdms' or 'rdbms' or 'dsa')
+        for token in q_tokens:
+            synonyms = ACRONYMS.get(token, [])
+            for syn in synonyms:
+                for course in available_courses:
+                    c_clean = re.sub(r'[^a-zA-Z0-9\s]', '', course).lower()
+                    if syn in c_clean:
+                        return course
+
+        # 1c. Initials match (e.g. 'RDBMS' matches 'Relational DataBase Management System')
+        def get_initials(text: str) -> str:
+            words = re.findall(r'[a-zA-Z0-9]+', text)
+            return "".join(w[0].lower() for w in words if w)
+
+        for course in available_courses:
+            initials = get_initials(course)
+            if q_clean == initials or q_clean in initials:
+                return course
+
+        # 1d. Token overlap match (at least 60% of query words appear in course title)
+        best_overlap_course = None
+        max_overlap_count = 0
+        for course in available_courses:
+            c_tokens = set(re.findall(r'[a-zA-Z0-9]+', course.lower()))
+            overlap = sum(1 for t in q_tokens if t in c_tokens)
+            if overlap > max_overlap_count and overlap >= len(q_tokens) * 0.5:
+                max_overlap_count = overlap
+                best_overlap_course = course
+
+        if best_overlap_course:
+            return best_overlap_course
+
+        # 2. AI Brain Semantic & Typo Matching with Gemini API
+        if self.has_key():
+            prompt = (
+                f"The user wants to navigate to the course: '{target_query}'.\n"
+                f"The user may have typed an acronym (e.g. 'RDBMS'), a typo (e.g. 'rdms'), a code, or an informal name.\n\n"
+                f"Here are the actual course titles available on ByteXL:\n"
+                + "\n".join(f"- {c}" for c in available_courses) + "\n\n"
+                "INSTRUCTIONS:\n"
+                "Identify which course title from the list best matches the user's intended target.\n"
+                "If a good match exists, return its exact title from the list. If none match, return null.\n"
+                "Respond ONLY with a JSON object: {\"matched_title\": \"<exact title from list or null>\", \"reason\": \"<brief reason>\"}"
+            )
+            try:
+                raw = self.ask_text(prompt, system_instruction="You are a course title matcher. Return pure JSON only.")
+                clean = re.sub(r"^```(?:json)?\s*", "", raw.strip(), flags=re.IGNORECASE)
+                clean = re.sub(r"\s*```$", "", clean.strip())
+                data = json.loads(clean)
+                matched = data.get("matched_title")
+                if matched:
+                    for c in available_courses:
+                        if c.strip().lower() == matched.strip().lower():
+                            return c
+            except Exception:
+                pass
+
+        return None
+
+
 # Global singleton instance
 brain = GeminiBrain()
+

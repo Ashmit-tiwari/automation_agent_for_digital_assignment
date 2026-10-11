@@ -340,18 +340,14 @@ class MasterByteXLAgent:
         proc_name = os.path.basename(exe)
         b_label = proc_name.replace(".exe", "").capitalize()
 
-        # If browser process is running without debugging, gracefully restart it with debugging on default profile
+        # If browser process is running without debugging:
+        # DO NOT kill it! Launch an automation profile window alongside it so existing tabs remain untouched!
         if is_browser_process_running(proc_name):
-            print(f"[*] Detected {b_label} is running in standard mode without remote debugging.")
-            print(f"[*] 🔄 Restarting {b_label} with debugging enabled (preserving all open tabs & logins)...")
-            try:
-                subprocess.run(f'taskkill /IM "{proc_name}" /F', shell=True, capture_output=True)
-                time.sleep(2.0)
-            except Exception:
-                pass
-
-        print(f"[*] Launching {b_label} browser with remote debugging on port {self.port} (using your existing profile)...")
-        launch_browser_on_port(self.port, pref, use_default_profile=True)
+            print(f"[*] 💡 {b_label} is running. Launching automation window on port {self.port} (your existing tabs remain open untouched)...")
+            launch_browser_on_port(self.port, pref, use_default_profile=False)
+        else:
+            print(f"[*] Launching {b_label} browser with remote debugging on port {self.port}...")
+            launch_browser_on_port(self.port, pref, use_default_profile=False)
 
         print(f"[*] Waiting for browser on port {self.port}...")
         for i in range(12):
@@ -1093,7 +1089,7 @@ class MasterByteXLAgent:
         await asyncio.sleep(1.5)
 
     async def handle_theory_reading(self, page):
-        """Scrolls smoothly through theory portion, clicks Mark As Completed, and clicks Next > or Take Quiz."""
+        """Scrolls smoothly through theory portion, clicks Mark As Completed, and clicks Next >."""
         title = await page.evaluate("() => { const h = document.querySelector('h1, h2, h3, h4, .chapter-title'); return h ? h.innerText.trim() : 'Theory Topic'; }")
         print(f"[*] 📖 Reading theory: '{title}'. Scrolling content...")
         try:
@@ -1107,20 +1103,21 @@ class MasterByteXLAgent:
             const step = Math.max(300, Math.floor(total / 5));
             for (let y = 0; y <= total; y += step) {
                 window.scrollTo({ top: y, behavior: 'smooth' });
-                await new Promise(r => setTimeout(r, 300));
+                await new Promise(r => setTimeout(r, 350));
                 window.scrollTo(0, y);
                 window.dispatchEvent(new Event('scroll'));
                 document.dispatchEvent(new Event('scroll'));
-                await new Promise(r => setTimeout(r, 200));
+                await new Promise(r => setTimeout(r, 250));
             }
             window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
             window.scrollTo(0, document.body.scrollHeight);
             window.dispatchEvent(new Event('scroll'));
             document.dispatchEvent(new Event('scroll'));
         }""")
+        await asyncio.sleep(2.5)
         await asyncio.sleep(2)
 
-        # 2. Click "Mark As Completed" button at bottom right
+        # 2. Click "Mark As Completed" button at bottom right (see user screenshot)
         marked = await page.evaluate("""() => {
             const btns = Array.from(document.querySelectorAll('button, a'));
             const markBtn = btns.find(b => {
@@ -1128,7 +1125,6 @@ class MasterByteXLAgent:
                 return txt === 'mark as completed' || txt === 'mark as complete' || txt === 'mark complete';
             });
             if (markBtn && !markBtn.disabled) {
-                markBtn.scrollIntoView({ behavior: 'smooth', block: 'center' });
                 markBtn.click();
                 markBtn.dispatchEvent(new MouseEvent('click', { bubbles: true }));
                 return true;
@@ -1141,33 +1137,14 @@ class MasterByteXLAgent:
         else:
             print(f"[*] Theory '{title}' marked complete or button not present.")
 
-        # 3. Check if "Take The Quiz Now!" card is at the bottom of the reading
-        take_quiz_btn = await page.evaluate("""() => {
-            const btns = Array.from(document.querySelectorAll('button, a'));
-            const quizBtn = btns.find(b => {
-                const t = (b.innerText || '').trim().toLowerCase();
-                return (t.includes('take the quiz') || t.includes('take quiz') || t.includes('start quiz')) && !b.disabled;
-            });
-            if (quizBtn) {
-                quizBtn.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                quizBtn.click();
-                return true;
-            }
-            return false;
-        }""")
-        if take_quiz_btn:
-            print("[OK] 🎯 Theory completed! Launching chapter quiz via 'Take The Quiz Now!'...")
-            await asyncio.sleep(3.5)
-            return True
-
-        # 4. Advance using 'Next >' button
+        # 3. Advance using 'Next >' button or next topic in sidebar
         advanced = await page.evaluate("""() => {
             const links = Array.from(document.querySelectorAll('button, a'));
             const nextBtn = links.find(l => {
                 const txt = (l.innerText || '').trim().toLowerCase();
-                return (txt === 'next >' || txt === 'next' || txt.startsWith('next >') || txt.includes('next >')) && !l.disabled;
+                return txt === 'next >' || txt === 'next' || txt.startsWith('next >') || txt.includes('next >');
             });
-            if (nextBtn) {
+            if (nextBtn && !nextBtn.disabled) {
                 nextBtn.click();
                 return true;
             }
@@ -1179,467 +1156,7 @@ class MasterByteXLAgent:
             await asyncio.sleep(3)
             return True
 
-        # 5. Fallback: Click next uncompleted topic in left sidebar
-        sidebar_next = await page.evaluate("""() => {
-            const items = Array.from(document.querySelectorAll('.MuiListItem-root, [role="button"], a')).filter(el => {
-                const t = (el.innerText || '').trim();
-                return t.length > 2 && t.length < 120 && !t.includes('Go Back To Course');
-            });
-            const selectedIdx = items.findIndex(el => el.classList.contains('Mui-selected') || el.getAttribute('aria-selected') === 'true');
-            if (selectedIdx !== -1 && selectedIdx + 1 < items.length) {
-                items[selectedIdx + 1].click();
-                return true;
-            }
-            return false;
-        }""")
-        if sidebar_next:
-            print("[*] Advancing to next topic via sidebar navigation...")
-            await asyncio.sleep(3)
-            return True
-
         return False
-
-    async def take_page_screenshot(self, page) -> Optional[bytes]:
-        try:
-            return await page.screenshot(type="jpeg", quality=80)
-        except Exception:
-            return None
-
-    async def get_visible_buttons(self, page) -> List[str]:
-        try:
-            return await page.evaluate("""() => {
-                const btns = Array.from(document.querySelectorAll('button, a')).map(b => (b.innerText || '').trim());
-                return Array.from(new Set(btns)).filter(t => t.length > 0 && t.length < 50).slice(0, 30);
-            }""")
-        except Exception:
-            return []
-
-    async def get_visible_headings(self, page) -> List[str]:
-        try:
-            return await page.evaluate("""() => {
-                const hs = Array.from(document.querySelectorAll('h1, h2, h3, h4, h5, h6, .chapter-title')).map(h => (h.innerText || '').trim());
-                return Array.from(new Set(hs)).filter(t => t.length > 1 && t.length < 100).slice(0, 15);
-            }""")
-        except Exception:
-            return []
-
-    async def get_active_page(self):
-        """Scans all open tabs and returns the most relevant active page."""
-        pages = list(self.context.pages)
-        if not pages:
-            return None, "none"
-
-        for p in pages:
-            try:
-                u = p.url.lower()
-                if "/test/" in u or "/assessment/" in u:
-                    return p, "test"
-            except Exception:
-                pass
-
-        for p in pages:
-            try:
-                u = p.url.lower()
-                if "/module/" in u or "/topic/" in u:
-                    return p, "module"
-            except Exception:
-                pass
-
-        for p in pages:
-            try:
-                u = p.url.lower()
-                if "bytexl" in u and "/courses" in u:
-                    return p, "courses"
-            except Exception:
-                pass
-
-        if self.bytexl_page and not self.bytexl_page.is_closed():
-            return self.bytexl_page, "default"
-        return pages[-1], "default"
-
-    async def classify_page_state(self, page) -> Dict[str, Any]:
-        """Classifies the current page into a recognized operational state."""
-        if not page or page.is_closed():
-            return {"state": "NO_PAGE"}
-
-        try:
-            return await page.evaluate("""() => {
-                const url = window.location.href.toLowerCase();
-                const bodyText = (document.body ? document.body.innerText : '').toLowerCase();
-
-                // 1. Login required
-                if (url.includes('/login') || url.includes('/signin') || !!document.querySelector('input[type="password"]')) {
-                    return { state: "LOGIN" };
-                }
-
-                // 2. Active Test / Assessment
-                const hasRadios = !!document.querySelector('[role="radiogroup"], .MuiRadioGroup-root, [role="radio"]');
-                const hasMonaco = !!document.querySelector('.monaco-editor, textarea#code');
-                if (url.includes('/test/') || url.includes('/assessment/') || hasRadios || hasMonaco) {
-                    return { state: "TEST_ACTIVE", isCoding: hasMonaco, isMCQ: hasRadios };
-                }
-
-                // 3. Reading / Theory Topic
-                const hasMarkBtn = Array.from(document.querySelectorAll('button, a')).some(b => {
-                    const t = (b.innerText || '').trim().toLowerCase();
-                    return t === 'mark as completed' || t === 'mark as complete' || t === 'mark complete';
-                });
-                const hasSummarize = bodyText.includes('summarize this chapter');
-                const hasReadingBreadcrumb = url.includes('/topic/') || !!document.querySelector('.chapter-title, .md-view');
-                if (hasMarkBtn || (hasReadingBreadcrumb && (hasSummarize || bodyText.includes('next >') || bodyText.includes('go back to course')))) {
-                    return { state: "READING_TOPIC", hasMarkBtn: hasMarkBtn };
-                }
-
-                // 4. Quiz / Lab Landing Page (with Start/Take button)
-                const openBtn = Array.from(document.querySelectorAll('button, a')).find(b => {
-                    const t = (b.innerText || '').toLowerCase();
-                    return (t.includes('take the quiz') || t.includes('take quiz') || t.includes('start quiz') || 
-                            t.includes('open quiz') || t.includes('start lab') || t.includes('open lab')) && !b.disabled;
-                });
-                if (openBtn) {
-                    return { state: "QUIZ_LANDING", btnText: openBtn.innerText.trim() };
-                }
-
-                // 5. Units & Chapters List
-                const isUnitsPage = bodyText.includes('units and chapters') || (url.includes('/courses/') && !url.includes('/module/') && !url.includes('/topic/'));
-                const hasUnitCards = Array.from(document.querySelectorAll('button, a')).some(b => {
-                    const t = (b.innerText || '').toLowerCase();
-                    return t.includes('continue learning') || t.includes('start learning') || t.includes('completed');
-                });
-                if (isUnitsPage && hasUnitCards) {
-                    return { state: "UNITS_LIST" };
-                }
-
-                // 6. Module Curriculum View (Accordions / Topic items)
-                const hasAccordions = document.querySelectorAll('.MuiAccordion-root').length > 0;
-                const hasTopicRows = Array.from(document.querySelectorAll('a, .MuiListItem-root')).some(el => {
-                    const t = (el.innerText || '').toLowerCase();
-                    return t.includes('reading material') || t.includes('challenge') || url.includes('/module/');
-                });
-                if (hasAccordions || hasTopicRows || url.includes('/module/')) {
-                    return { state: "MODULE_CURRICULUM" };
-                }
-
-                // 7. Course Catalog
-                if (url.endsWith('/courses') || url.endsWith('/courses/') || bodyText.includes('my courses')) {
-                    return { state: "COURSES_CATALOG" };
-                }
-
-                return { state: "UNKNOWN" };
-            }""")
-        except Exception as e:
-            return {"state": "UNKNOWN", "error": str(e)}
-
-    async def click_button_reliably(self, page, text: str) -> bool:
-        """Clicks an element by text using native Playwright events and JS fallback."""
-        clean = (text or "").strip()
-        if not clean:
-            return False
-
-        try:
-            loc = page.locator(f'button:has-text("{clean}"), a:has-text("{clean}")').first
-            if await loc.count() > 0 and await loc.is_visible():
-                await loc.scroll_into_view_if_needed()
-                await loc.click(timeout=3000)
-                return True
-        except Exception:
-            pass
-
-        try:
-            return await page.evaluate("""(targetText) => {
-                const targetLower = targetText.toLowerCase();
-                const all = Array.from(document.querySelectorAll('button, a, [role="button"], span.MuiButton-label'));
-                const match = all.find(el => {
-                    const t = (el.innerText || '').trim().toLowerCase();
-                    return t === targetLower || t.includes(targetLower);
-                });
-                if (match) {
-                    const btn = match.closest('button, a, [role="button"]') || match;
-                    btn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-                    btn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
-                    btn.click();
-                    return true;
-                }
-                return false;
-            }""", clean)
-        except Exception:
-            return False
-
-    async def find_and_click_uncompleted_unit(self, page) -> Dict[str, Any]:
-        """Finds the uncompleted unit card and clicks Continue Learning / Resume."""
-        try:
-            res = await page.evaluate("""() => {
-                const allButtons = Array.from(document.querySelectorAll('button, a'));
-
-                // 1. Find exact blue button: Continue Learning, Start Learning, Resume
-                let targetBtn = allButtons.find(b => {
-                    const txt = (b.innerText || '').trim().toLowerCase();
-                    return (txt === 'continue learning' || txt === 'start learning' || txt === 'resume' || txt === 'resume my journey') && !b.disabled;
-                });
-
-                // 2. Fallback: primary button not marked completed
-                if (!targetBtn) {
-                    targetBtn = Array.from(document.querySelectorAll('button.MuiButton-containedPrimary')).find(b => {
-                        const txt = (b.innerText || '').trim().toLowerCase();
-                        return !txt.includes('completed');
-                    });
-                }
-
-                // 3. Fallback: button containing continue learning / resume
-                if (!targetBtn) {
-                    targetBtn = allButtons.find(b => {
-                        const txt = (b.innerText || '').trim().toLowerCase();
-                        return (txt.includes('continue learning') || txt.includes('start learning') || txt.includes('resume')) && !txt.includes('completed');
-                    });
-                }
-
-                if (targetBtn) {
-                    let card = targetBtn.closest('.MuiPaper-root, .MuiCard-root, .MuiBox-root, [class*="MuiButton-outlined"]') || targetBtn.parentElement;
-                    let unitTitle = 'Unit';
-                    if (card) {
-                        const lines = card.innerText.split(/\\r?\\n/).map(l => l.trim()).filter(Boolean);
-                        const tLine = lines.find(l => !l.toLowerCase().includes('continue learning') && !l.toLowerCase().includes('start learning') && !l.toLowerCase().includes('completed') && !l.toLowerCase().includes('challenge') && !l.toLowerCase().includes('chapter'));
-                        if (tLine) unitTitle = tLine;
-                    }
-                    targetBtn.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                    targetBtn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-                    targetBtn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
-                    targetBtn.click();
-                    return { clicked: true, title: unitTitle };
-                }
-                return { clicked: false };
-            }""")
-
-            if res.get("clicked"):
-                return res
-
-            loc = page.locator('button:has-text("Continue Learning"), a:has-text("Continue Learning")').first
-            if await loc.count() > 0 and await loc.is_visible():
-                await loc.scroll_into_view_if_needed()
-                await loc.click(timeout=3000)
-                return {"clicked": True, "title": "Unit"}
-        except Exception as e:
-            print(f"[!] Unit click interaction: {e}")
-
-        return {"clicked": False}
-
-    async def expand_all_accordions(self, page):
-        """Expands all collapsed submodule accordions."""
-        try:
-            await page.evaluate("""() => {
-                const summaries = Array.from(document.querySelectorAll('.MuiAccordionSummary-root[aria-expanded="false"], .MuiAccordionSummary-root:not(.Mui-expanded)'));
-                summaries.forEach(s => s.click());
-            }""")
-        except Exception:
-            pass
-
-    async def find_next_uncompleted_topic(self, page, done_list: List[str]) -> Optional[Dict[str, Any]]:
-        """Scans module view for the next uncompleted topic row."""
-        try:
-            return await page.evaluate("""(doneList) => {
-                const summaries = Array.from(document.querySelectorAll('.MuiAccordionSummary-root[aria-expanded="false"], .MuiAccordionSummary-root:not(.Mui-expanded)'));
-                summaries.forEach(s => s.click());
-
-                const candidateRows = Array.from(document.querySelectorAll(
-                    '.MuiAccordion-root a, .MuiAccordion-root .MuiListItem-root, .MuiAccordionDetails-root a, .MuiAccordionDetails-root .MuiListItem-root, .MuiAccordionDetails-root > div, a.MuiListItem-root, .MuiListItem-root'
-                )).filter(el => {
-                    const t = (el.innerText || '').trim();
-                    return t.length > 2 && t.length < 160 && !t.toLowerCase().includes('reading materials') && !t.toLowerCase().includes('challenge');
-                });
-
-                for (const row of candidateRows) {
-                    const rawText = row.innerText.trim();
-                    const titleLine = rawText.split('\\n')[0].trim();
-
-                    if (doneList.some(d => titleLine.includes(d) || (d && d.includes(titleLine)))) continue;
-
-                    const accordion = row.closest('.MuiAccordion-root');
-                    if (accordion) {
-                        const accSummary = accordion.querySelector('.MuiAccordionSummary-root');
-                        if (accSummary && (accSummary.innerText || '').toLowerCase().includes('completed')) {
-                            continue;
-                        }
-                    }
-
-                    const cb = row.querySelector('input[type="checkbox"], .MuiCheckbox-root, [data-testid*="CheckBox"], [data-testid*="Check"], span[aria-label*="complete"]');
-                    const isChecked = row.innerHTML.includes('Mui-checked') ||
-                                      row.querySelector('[data-testid="CheckBoxIcon"]') !== null ||
-                                      row.querySelector('[data-testid*="Check"]') !== null ||
-                                      row.getAttribute('aria-checked') === 'true' ||
-                                      row.classList.contains('completed') ||
-                                      row.innerText.includes('Completed') ||
-                                      (cb && (cb.checked || cb.getAttribute('aria-label') === 'Mark as incomplete'));
-
-                    if (!isChecked) {
-                        return {
-                            text: titleLine,
-                            href: row.href || (row.querySelector('a') ? row.querySelector('a').href : null)
-                        };
-                    }
-                }
-                return null;
-            }""", done_list)
-        except Exception:
-            return None
-
-    async def click_topic_reliably(self, page, topic_info: Dict[str, Any]) -> bool:
-        name = topic_info.get("text", "")
-        href = topic_info.get("href")
-
-        try:
-            clicked = await page.evaluate("""(targetName) => {
-                const clean = targetName.toLowerCase();
-                const links = Array.from(document.querySelectorAll('.MuiAccordion-root a, .MuiAccordion-root .MuiListItem-root, a, .MuiListItem-root, [role="button"]'));
-                const target = links.find(l => (l.innerText || '').toLowerCase().includes(clean));
-                if (target) {
-                    const t = target.querySelector('.MuiListItemText-root') || target;
-                    t.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                    t.click();
-                    return true;
-                }
-                return false;
-            }""", name)
-            if clicked:
-                return True
-        except Exception:
-            pass
-
-        if href:
-            try:
-                await page.goto(href)
-                return True
-            except Exception:
-                pass
-
-        return False
-
-    async def check_and_click_next_unit(self, page) -> bool:
-        try:
-            return await page.evaluate("""() => {
-                const btns = Array.from(document.querySelectorAll('button, a'));
-                const btn = btns.find(b => {
-                    const t = (b.innerText || '').toLowerCase();
-                    return (t.includes('go to next unit') || t.includes('next unit')) && !b.disabled;
-                });
-                if (btn) {
-                    btn.click();
-                    return true;
-                }
-                return false;
-            }""")
-        except Exception:
-            return False
-
-    async def check_and_click_back_to_course(self, page) -> bool:
-        try:
-            return await page.evaluate("""() => {
-                const links = Array.from(document.querySelectorAll('button, a'));
-                const back = links.find(l => {
-                    const t = (l.innerText || '').toLowerCase();
-                    return t.includes('go back to course') || t.includes('back to course') || t.includes('units and chapters');
-                });
-                if (back) {
-                    back.click();
-                    return true;
-                }
-                return false;
-            }""")
-        except Exception:
-            return False
-
-    async def is_landing_already_completed(self, page, activity_name: str) -> bool:
-        try:
-            return await page.evaluate("""(name) => {
-                const bodyText = (document.body ? document.body.innerText : '').toLowerCase();
-                return bodyText.includes('highest score') ||
-                       bodyText.includes('quiz completed') ||
-                       bodyText.includes('you scored') ||
-                       bodyText.includes('already submitted');
-            }""", activity_name)
-        except Exception:
-            return False
-
-    async def advance_next(self, page) -> bool:
-        try:
-            return await page.evaluate("""() => {
-                const links = Array.from(document.querySelectorAll('button, a'));
-                const nextBtn = links.find(l => {
-                    const txt = (l.innerText || '').trim().toLowerCase();
-                    return (txt === 'next >' || txt === 'next' || txt.includes('next >') || txt.includes('go to next unit')) && !l.disabled;
-                });
-                if (nextBtn) {
-                    nextBtn.click();
-                    return true;
-                }
-                return false;
-            }""")
-        except Exception:
-            return False
-
-    async def handle_courses_catalog(self, page, target_course: str) -> bool:
-        """Navigates target course or first uncompleted course in catalog."""
-        t_course = (target_course or "").strip()
-        if t_course:
-            print(f"[*] Searching for course '{t_course}' in catalog...")
-            try:
-                search_input = await page.wait_for_selector('input[placeholder*="search" i]', timeout=4000)
-                if search_input:
-                    await search_input.fill("")
-                    await search_input.fill(t_course)
-                    await page.keyboard.press("Enter")
-                    await asyncio.sleep(2)
-            except Exception:
-                pass
-
-            found = await page.evaluate("""(t) => {
-                const tLower = t.toLowerCase();
-                const cards = Array.from(document.querySelectorAll('.MuiPaper-root, .MuiCard-root, .MuiBox-root')).filter(c => {
-                    const txt = (c.innerText || '').toLowerCase();
-                    return (txt.includes('completion') || txt.includes('continue learning') || txt.includes('resume')) && txt.includes(tLower);
-                });
-                if (cards.length > 0) {
-                    const btn = Array.from(cards[0].querySelectorAll('button, a')).find(b => {
-                        const txt = (b.innerText || '').toLowerCase();
-                        return txt.includes('continue learning') || txt.includes('start learning') || txt.includes('resume');
-                    }) || cards[0].querySelector('button, a') || cards[0];
-                    btn.click();
-                    return true;
-                }
-                return false;
-            }""", t_course)
-            if found:
-                print(f"[OK] 🎯 Opened course: '{t_course}'!")
-                return True
-
-        print("[*] Scanning 'My Courses' for uncompleted course (< 100%)...")
-        return await page.evaluate("""() => {
-            const btnList = Array.from(document.querySelectorAll('button, a')).filter(b => {
-                const txt = (b.innerText || '').toLowerCase();
-                return txt.includes('continue learning') || txt.includes('start learning') || txt.includes('resume');
-            });
-            for (let btn of btnList) {
-                let p = btn;
-                let isCompleted = false;
-                for (let i = 0; i < 7; i++) {
-                    if (!p.parentElement) break;
-                    p = p.parentElement;
-                    const txt = p.innerText || '';
-                    if (txt.includes('100%') && txt.includes('completion')) {
-                        isCompleted = true;
-                        break;
-                    }
-                }
-                if (!isCompleted) {
-                    btn.click();
-                    return true;
-                }
-            }
-            if (btnList.length > 0) {
-                btnList[0].click();
-                return true;
-            }
-            return false;
-        }""")
 
     # ==========================
     # 3. FULL COURSE & MODULE AUTO-NAVIGATOR
@@ -1653,237 +1170,576 @@ class MasterByteXLAgent:
         print("[🚀] BYTE-XL AUTONOMOUS AGENT ACTIVE")
         print("="*60)
 
-        target_course = (self.target or "").strip()
-        print(f"[*] Autonomous AI Assistant Active (Target: '{target_course or 'Next Uncompleted'}')")
+        # Login Gatekeeper: Check if ByteXL is at login / signin screen
+        is_login = await self.bytexl_page.evaluate("""() => {
+            const url = window.location.href.toLowerCase();
+            if (url.includes('/login') || url.includes('/signin')) return true;
+            const hasPass = !!document.querySelector('input[type="password"]');
+            const hasSignIn = Array.from(document.querySelectorAll('button, input[type="submit"]')).some(b => {
+                const t = (b.innerText || b.value || '').toLowerCase();
+                return t.includes('sign in') || t.includes('log in') || t.includes('login');
+            });
+            return hasPass && hasSignIn;
+        }""")
 
-        completed_set = set()
-        activities_completed = 0
-        current_activity_name = ""
-        stuck_counter = 0
-        last_url_state = ""
-        step = 0
-        max_steps = 200
-
-        while step < max_steps:
-            step += 1
-            await asyncio.sleep(1.5)
-
-            # 1. Multi-tab detection: find active page across all tabs
-            active_page, p_kind = await self.get_active_page()
-            if not active_page:
-                print("[⚠️] No active browser tab found. Waiting 3s...")
-                await asyncio.sleep(3)
-                continue
-
-            try:
-                await active_page.bring_to_front()
-            except Exception:
-                pass
-
-            # 2. Classify Page State
-            state_info = await self.classify_page_state(active_page)
-            current_state = state_info.get("state", "UNKNOWN")
-            current_url = active_page.url
-            state_sig = f"{current_state}:{current_url}"
-
-            if state_sig == last_url_state:
-                stuck_counter += 1
-            else:
-                stuck_counter = 0
-                last_url_state = state_sig
-
-            # Handle LOGIN State
-            if current_state == "LOGIN":
-                print("[⚠️] ByteXL login required! Please sign in in the browser to continue...")
-                await asyncio.sleep(3)
-                continue
-
-            # Handle TEST_ACTIVE State (MCQ Quiz or Coding Lab)
-            if current_state == "TEST_ACTIVE":
-                print("[*] 🧠 Active Assessment detected. Solving with Gemini...")
-                if state_info.get("isCoding"):
-                    await self.solve_coding_lab(active_page)
-                else:
-                    await self.solve_mcq_test(active_page)
-
-                if current_activity_name:
-                    completed_set.add(current_activity_name)
-                activities_completed += 1
-
-                # If test_page was a secondary popup tab, close it
-                if active_page != self.bytexl_page and len(self.context.pages) > 1:
+        if is_login:
+            print("[⚠️] You are on the ByteXL login page! Please log in to ByteXL in the browser.")
+            print("[*] The agent is paused and will automatically resume as soon as you log in...")
+            while True:
+                await asyncio.sleep(2)
+                found_logged_in = None
+                for p in list(self.context.pages):
                     try:
-                        await active_page.close()
+                        u = p.url.lower()
+                        if "bytexl" in u:
+                            if "/login" not in u and "/signin" not in u:
+                                has_pass = await p.evaluate("() => !!document.querySelector('input[type=\"password\"]')")
+                                if not has_pass:
+                                    found_logged_in = p
+                                    break
                     except Exception:
                         pass
+
+                if found_logged_in:
+                    self.bytexl_page = found_logged_in
+                    print(f"[OK] ByteXL login detected in tab: {found_logged_in.url[:60]}! Proceeding to courses...")
+                    await asyncio.sleep(2)
+                    break
+
+                try:
+                    still_login = await self.bytexl_page.evaluate("""() => {
+                        const url = window.location.href.toLowerCase();
+                        if (url.includes('/login') || url.includes('/signin')) return true;
+                        return !!document.querySelector('input[type="password"]');
+                    }""")
+                    if not still_login:
+                        print("[OK] ByteXL login detected! Proceeding to courses...")
+                        await asyncio.sleep(2)
+                        break
+                except Exception:
+                    await asyncio.sleep(2)
+                    print("[OK] ByteXL login redirect detected! Proceeding to courses...")
+                    break
+
+        # Check Gemini sign-in notice
+        try:
+            gemini_login = await self.gemini_page.evaluate("""() => {
+                const url = window.location.href.toLowerCase();
+                return url.includes('accounts.google.com');
+            }""")
+            if gemini_login:
+                print("[⚠️] Notice: Please ensure you are signed into Gemini in the Gemini tab.")
+        except Exception:
+            pass
+
+        # Instant Check: Is an assessment or quiz tab ALREADY open in the browser?
+        already_open_test = None
+        for p in self.context.pages:
+            u = p.url.lower()
+            if "/test/" in u or "/assessment/" in u:
+                already_open_test = p
+                break
+        if not already_open_test and self.bytexl_page:
+            u = self.bytexl_page.url.lower()
+            if "/test/" in u or "/assessment/" in u:
+                already_open_test = self.bytexl_page
+
+        if already_open_test:
+            print(f"[🎯] Active Quiz/Assessment already open in browser ({already_open_test.url[:60]}...). Solving directly!")
+        elif self.target:
+            # If target course/module is specified, search and open it first
+            already_inside = await self.bytexl_page.evaluate("""(target) => {
+                const pageText = (document.body ? document.body.innerText : '').toLowerCase();
+                const t = target.toLowerCase();
+                const isCourseUrl = window.location.href.includes('/courses/') || window.location.href.includes('/module/');
+                return isCourseUrl && pageText.includes(t);
+            }""", self.target)
+
+            if already_inside:
+                print(f"[🎯] Already inside target course: '{self.target}'! Continuing directly...")
+            else:
+                print(f"[🎯] Target course specified: '{self.target}'. Resolving course in 'My Courses'...")
+                curr_url = self.bytexl_page.url.lower()
+                if not curr_url.rstrip("/").endswith("/courses"):
+                    await self.bytexl_page.goto("https://app.bytexl.ai/courses")
+                    await asyncio.sleep(3)
+
+                # Extract visible course cards
+                cards_info = await self.bytexl_page.evaluate("""() => {
+                    const cards = Array.from(document.querySelectorAll('.MuiCard-root, .MuiPaper-root, .MuiBox-root')).filter(c => {
+                        const t = (c.innerText || '').toLowerCase();
+                        return t.includes('completion') || t.includes('continue learning') || t.includes('start learning') || t.includes('resume');
+                    });
+                    return cards.map((c, i) => {
+                        const titleEl = c.querySelector('h3, h4, h5, h6, .MuiTypography-h6, .MuiTypography-h5');
+                        return titleEl ? titleEl.innerText.trim() : c.innerText.split('\\n')[0].trim();
+                    });
+                }""")
+
+                matched = brain.match_course(self.target, cards_info)
+                if matched:
+                    print(f"[OK] 🎯 Smart Match: Target '{self.target}' resolved to '{matched}'! Opening...")
+                    clicked = await self.bytexl_page.evaluate("""(matchTitle) => {
+                        const cards = Array.from(document.querySelectorAll('.MuiCard-root, .MuiPaper-root, .MuiBox-root'));
+                        const targetCard = cards.find(c => c.innerText.includes(matchTitle));
+                        if (targetCard) {
+                            const btn = Array.from(targetCard.querySelectorAll('button, a')).find(b => {
+                                const txt = (b.innerText || '').toLowerCase();
+                                return txt.includes('continue learning') || txt.includes('start learning') || txt.includes('resume');
+                            }) || targetCard.querySelector('button, a') || targetCard;
+                            btn.click();
+                            return true;
+                        }
+                        return false;
+                    }""", matched)
+                    if clicked:
+                        await asyncio.sleep(4)
+                else:
+                    # Try search bar if not in initial cards
+                    try:
+                        search_input = await self.bytexl_page.wait_for_selector('input[placeholder*="search" i]', timeout=3500)
+                        if search_input:
+                            await search_input.fill("")
+                            await search_input.fill(self.target)
+                            await self.bytexl_page.keyboard.press("Enter")
+                            await asyncio.sleep(2.0)
+
+                            searched_cards = await self.bytexl_page.evaluate("""() => {
+                                const cards = Array.from(document.querySelectorAll('.MuiCard-root, .MuiPaper-root, .MuiBox-root')).filter(c => {
+                                    const t = (c.innerText || '').toLowerCase();
+                                    return t.includes('completion') || t.includes('continue learning') || t.includes('start learning') || t.includes('resume');
+                                });
+                                return cards.map(c => {
+                                    const titleEl = c.querySelector('h3, h4, h5, h6, .MuiTypography-h6, .MuiTypography-h5');
+                                    return titleEl ? titleEl.innerText.trim() : c.innerText.split('\\n')[0].trim();
+                                });
+                            }""")
+
+                            matched_s = brain.match_course(self.target, searched_cards)
+                            if matched_s:
+                                print(f"[OK] 🎯 Found course: '{matched_s}'! Entering...")
+                                await self.bytexl_page.evaluate("""(matchTitle) => {
+                                    const cards = Array.from(document.querySelectorAll('.MuiCard-root, .MuiPaper-root, .MuiBox-root'));
+                                    const targetCard = cards.find(c => c.innerText.includes(matchTitle)) || cards[0];
+                                    if (targetCard) {
+                                        const btn = Array.from(targetCard.querySelectorAll('button, a')).find(b => {
+                                            const txt = (b.innerText || '').toLowerCase();
+                                            return txt.includes('continue learning') || txt.includes('start learning') || txt.includes('resume');
+                                        }) || targetCard.querySelector('button, a') || targetCard;
+                                        btn.click();
+                                    }
+                                }""", matched_s)
+                                await asyncio.sleep(4)
+                            else:
+                                print(f"[!] Target '{self.target}' search yielded 0 results. Restoring full catalog...")
+                                await search_input.fill("")
+                                await self.bytexl_page.keyboard.press("Enter")
+                                await asyncio.sleep(1.5)
+                    except Exception:
+                        pass
+
+        while True:
+            # Check open pages for any active Test / Quiz / Lab
+            test_page = None
+            for p in self.context.pages:
+                u = p.url.lower()
+                if "/test/" in u or "/assessment/" in u:
+                    test_page = p
+                    break
+            if not test_page and self.bytexl_page:
+                u = self.bytexl_page.url.lower()
+                if "/test/" in u or "/assessment/" in u:
+                    test_page = self.bytexl_page
+
+            if test_page:
+                has_editor = await test_page.evaluate("() => !!document.querySelector('.monaco-editor, textarea#code')")
+                if has_editor:
+                    await self.solve_coding_lab(test_page)
+                else:
+                    await self.solve_mcq_test(test_page)
+
+                # Close test page if it is a secondary popup window
+                for p in list(self.context.pages):
+                    if p != self.bytexl_page and ("/test/" in p.url.lower() or "/assessment/" in p.url.lower()):
+                        try:
+                            await p.close()
+                        except Exception:
+                            pass
                 await asyncio.sleep(2)
 
-                # Return focus to main course page and tick side completion checkbox
-                course_page, _ = await self.get_active_page()
-                if course_page and current_activity_name:
-                    ticked = await self.tick_activity_checkbox(current_activity_name)
-                    if ticked:
-                        print(f"[OK] ✅ Ticked completion box for '{current_activity_name}'!")
+                # Post-Activity: Tick the side completion box on the sidebar/accordion!
+                await self.tick_activity_checkbox(self.current_activity_name)
+
+                # Open next submodule: Expand any collapsed accordion sections
+                await self.bytexl_page.evaluate("""() => {
+                    const buttons = Array.from(document.querySelectorAll('button.MuiAccordionSummary-root[aria-expanded="false"], .MuiAccordionSummary-root:not(.Mui-expanded)'));
+                    buttons.forEach(b => b.click());
+                }""")
+                await asyncio.sleep(1)
                 continue
 
-            # Handle READING_TOPIC State
-            if current_state == "READING_TOPIC":
-                print("[*] Reading topic detected. Processing reading content...")
-                advanced = await self.handle_theory_reading(active_page)
-                if current_activity_name:
-                    completed_set.add(current_activity_name)
-                activities_completed += 1
-                await asyncio.sleep(2)
-                continue
+            # Check if on an Activity landing page with "Open Quiz..." or "Open Lab..." or "Take The Quiz Now!"
+            try:
+                await self.bytexl_page.bring_to_front()
+            except Exception:
+                pass
+            unit_action = await self.bytexl_page.evaluate("""() => {
+                const btns = Array.from(document.querySelectorAll('button, a'));
+                const openBtn = btns.find(b => {
+                    const txt = (b.innerText || '').toLowerCase();
+                    return (txt.includes('open quiz') || txt.includes('take the quiz') || txt.includes('open lab') ||
+                            txt.includes('start lab') || txt.includes('start quiz') || txt.includes('take quiz')) && !b.disabled;
+                }) || document.querySelector('button.MuiButton-containedPrimary');
+                const nextUnitBtn = btns.find(b => {
+                    const txt = (b.innerText || '').toLowerCase();
+                    return txt.includes('go to next unit') || txt.includes('next unit');
+                });
+                return {
+                    openText: openBtn ? openBtn.innerText.trim() : null,
+                    hasNextUnit: !!nextUnitBtn
+                };
+            }""")
 
-            # Handle QUIZ_LANDING State
-            if current_state == "QUIZ_LANDING":
-                is_done = await self.is_landing_already_completed(active_page, current_activity_name)
-                if is_done:
-                    print(f"[OK] Activity '{current_activity_name or 'Quiz'}' is already completed. Advancing...")
-                    if current_activity_name:
-                        completed_set.add(current_activity_name)
-                    await self.advance_next(active_page)
+            if unit_action.get("openText"):
+                open_lower = unit_action['openText'].lower()
+                is_quiz_activity = "quiz" in open_lower or "take" in open_lower
+
+                # Check if this quiz/activity is already ticked or completed in sidebar
+                check_status = await self.bytexl_page.evaluate("""(name) => {
+                    const cleanName = (name || '').trim().toLowerCase();
+                    const allItems = Array.from(document.querySelectorAll(
+                        '.MuiAccordion-root a, .MuiAccordion-root .MuiListItem-root, .MuiListItem-root, a, div[role="button"]'
+                    ));
+
+                    let row = null;
+                    if (cleanName) {
+                        row = allItems.find(el => {
+                            const t = (el.innerText || '').trim().toLowerCase();
+                            return t.includes(cleanName) || cleanName.includes(t.split('\\n')[0]);
+                        });
+                    }
+                    if (!row) {
+                        row = document.querySelector('.MuiListItem-root.Mui-selected, .Mui-selected, [aria-selected="true"]');
+                    }
+
+                    let isChecked = false;
+                    if (row) {
+                        const cb = row.querySelector('input[type="checkbox"], .MuiCheckbox-root, [data-testid*="CheckBox"], [data-testid*="Check"]');
+                        isChecked = row.innerHTML.includes('Mui-checked') ||
+                                    row.querySelector('[data-testid*="Check"]') !== null ||
+                                    row.getAttribute('aria-checked') === 'true' ||
+                                    row.classList.contains('completed') ||
+                                    (cb && (cb.checked || cb.getAttribute('aria-label') === 'Mark as incomplete'));
+                    }
+
+                    const bodyText = document.body.innerText.toLowerCase();
+                    const hasCompletedResult = bodyText.includes('highest score') ||
+                                               bodyText.includes('quiz completed') ||
+                                               bodyText.includes('you scored') ||
+                                               bodyText.includes('already submitted');
+
+                    return {
+                        isChecked: isChecked,
+                        hasCompletedResult: hasCompletedResult
+                    };
+                }""", self.current_activity_name)
+
+                # 1. If checkbox is already ticked -> ignore it, it is already completed!
+                if check_status.get("isChecked"):
+                    print(f"[OK] Side checkbox for '{self.current_activity_name or 'quiz'}' is already ticked (Completed). Ignoring and advancing to next topic...")
+                    if self.current_activity_name:
+                        self.completed_activities.add(self.current_activity_name)
+                    # Advance via Next button
+                    advanced = await self.bytexl_page.evaluate("""() => {
+                        const links = Array.from(document.querySelectorAll('button, a'));
+                        const nextBtn = links.find(l => {
+                            const txt = (l.innerText || '').trim().toLowerCase();
+                            return txt === 'next >' || txt === 'next' || txt.includes('next >') || txt.includes('go to next unit');
+                        });
+                        if (nextBtn && !nextBtn.disabled) {
+                            nextBtn.click();
+                            return true;
+                        }
+                        return false;
+                    }""")
+                    await asyncio.sleep(2.5)
                     continue
 
-                btn_text = state_info.get("btnText", "Take The Quiz Now!")
-                print(f"[*] Launching Activity: '{btn_text}'...")
-                await self.click_button_reliably(active_page, btn_text)
+                # 2. If quiz has completed results on page but checkbox not checked -> tick it and advance!
+                if check_status.get("hasCompletedResult") and not check_status.get("isChecked"):
+                    print(f"[OK] Quiz '{self.current_activity_name or 'quiz'}' shows completed results. Ticking side checkbox...")
+                    await self.tick_activity_checkbox(self.current_activity_name)
+                    if self.current_activity_name:
+                        self.completed_activities.add(self.current_activity_name)
+                    await asyncio.sleep(2)
+                    continue
+
+                # 3. Assessment is not completed -> launch and solve it!
+                print(f"[*] Assessment detected. Clicking '{unit_action['openText']}'...")
+                await self.bytexl_page.evaluate("""(txt) => {
+                    const btns = Array.from(document.querySelectorAll('button, a'));
+                    const target = btns.find(b => (b.innerText || '').trim().toLowerCase() === txt.toLowerCase()) ||
+                                   document.querySelector('button.MuiButton-containedPrimary');
+                    if (target) target.click();
+                }""", unit_action['openText'])
                 await asyncio.sleep(4)
                 continue
 
-            # Handle MODULE_CURRICULUM State
-            if current_state == "MODULE_CURRICULUM":
-                print("[*] Processing module curriculum...")
-                await self.expand_all_accordions(active_page)
+            # Check if on a Theory / Reading Page (contains Mark As Completed / Summarize / /topic/)
+            is_theory_page = await self.bytexl_page.evaluate("""() => {
+                const btns = Array.from(document.querySelectorAll('button, a'));
+                const hasMarkBtn = !!btns.find(b => {
+                    const txt = (b.innerText || '').trim().toLowerCase();
+                    return txt === 'mark as completed' || txt === 'mark as complete';
+                });
+                const hasSummarize = !!btns.find(b => (b.innerText || '').toLowerCase().includes('summarize this chapter'));
+                const isTopicUrl = window.location.href.includes('/topic/');
+                return hasMarkBtn || hasSummarize || isTopicUrl;
+            }""")
 
-                next_topic = await self.find_next_uncompleted_topic(active_page, list(completed_set))
-                if next_topic:
-                    current_activity_name = next_topic['text']
-                    print(f"[🎯] Opening topic: '{current_activity_name}'")
-                    clicked = await self.click_topic_reliably(active_page, next_topic)
-                    await asyncio.sleep(3.5)
+            if is_theory_page:
+                advanced = await self.handle_theory_reading(self.bytexl_page)
+                if self.current_activity_name:
+                    self.completed_activities.add(self.current_activity_name)
+                if advanced:
+                    continue
+
+            elif unit_action.get("hasNextUnit") and len(self.completed_activities) > 0:
+                print("[*] Advancing: 'Go To Next Unit'...")
+                await self.bytexl_page.evaluate("""() => {
+                    const btn = Array.from(document.querySelectorAll('button, a')).find(b => (b.innerText || '').toLowerCase().includes('next unit'));
+                    if (btn) btn.click();
+                }""")
+                await asyncio.sleep(3)
+                continue
+
+            current_url = self.bytexl_page.url.lower()
+
+            # Check if on Course units list (Units and Chapters page: /courses/<id>/<slug>)
+            if "/courses/" in current_url and "/module/" not in current_url:
+                # Check if this page already contains course module accordions (e.g. System Design)
+                has_curriculum = await self.bytexl_page.evaluate("""() => {
+                    const accs = Array.from(document.querySelectorAll('.MuiAccordion-root'));
+                    return accs.some(a => {
+                        const t = (a.innerText || '').toLowerCase();
+                        return t.includes('reading material') || t.includes('challenge') || t.includes('chapter') || t.includes('quiz');
+                    });
+                }""")
+
+                if has_curriculum:
+                    print("[*] 🎯 Module curriculum detected directly on course page! Proceeding to topics...")
+                else:
+                    print("\n[*] On Units & Chapters page. Finding uncompleted unit with 'Continue Learning'...")
+                    unit_res = await self.bytexl_page.evaluate("""() => {
+                        const allButtons = Array.from(document.querySelectorAll('button, a'));
+                        
+                        // 1. Exact match for blue button
+                        let actionBtn = allButtons.find(b => {
+                            const txt = (b.innerText || '').trim().toLowerCase();
+                            return (txt === 'continue learning' || txt === 'start learning' || txt === 'resume');
+                        });
+
+                        // 2. Fallback: MuiButton-containedPrimary
+                        if (!actionBtn) {
+                            actionBtn = document.querySelector('button.MuiButton-containedPrimary');
+                        }
+
+                        // 3. Fallback: contains continue learning without completed
+                        if (!actionBtn) {
+                            actionBtn = allButtons.find(b => {
+                                const txt = (b.innerText || '').trim().toLowerCase();
+                                return (txt.includes('continue learning') || txt.includes('start learning')) && !txt.includes('completed');
+                            });
+                        }
+
+                        if (actionBtn) {
+                            let card = actionBtn.closest('.MuiPaper-root, .MuiCard-root, .MuiBox-root, [class*="MuiButton-outlined"]') || actionBtn.parentElement;
+                            let unitTitle = 'Unit';
+                            if (card) {
+                                const lines = card.innerText.split('\\n').map(l => l.trim()).filter(Boolean);
+                                const tLine = lines.find(l => !l.toLowerCase().includes('continue learning') && !l.toLowerCase().includes('start learning') && !l.toLowerCase().includes('completed') && !l.toLowerCase().includes('challenge') && !l.toLowerCase().includes('chapter'));
+                                if (tLine) unitTitle = tLine;
+                            }
+                            actionBtn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+                            actionBtn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+                            actionBtn.click();
+                            return { clicked: true, title: unitTitle };
+                        }
+                        return { clicked: false };
+                    }""")
+
+                    if unit_res.get("clicked"):
+                        print(f"[OK] Clicked 'Continue Learning' on: {unit_res.get('title')}")
+                        await asyncio.sleep(4)
+                        try:
+                            await self.bytexl_page.wait_for_url(lambda u: "/module/" in u.lower(), timeout=8000)
+                            print(f"[OK] Entered Module view: '{unit_res.get('title')}'!")
+                        except Exception:
+                            await asyncio.sleep(4)
+                        continue
+
+            # Check if on Module view / curriculum page
+            if "/courses/" in current_url or "/module/" in current_url:
+                print("\n[*] On Module view. Expanding all submodules and scanning for uncompleted Topics, Quizzes and Labs...")
+                # Expand all collapsed submodule accordions
+                await self.bytexl_page.evaluate("""() => {
+                    const summaries = Array.from(document.querySelectorAll('.MuiAccordionSummary-root[aria-expanded="false"], .MuiAccordionSummary-root:not(.Mui-expanded)'));
+                    summaries.forEach(s => s.click());
+                }""")
+                await asyncio.sleep(1.5)
+
+                # Scan across all submodules for uncompleted topic (Reading or Quiz/Lab)
+                uncompleted_item = await self.bytexl_page.evaluate("""(doneList) => {
+                    const candidateRows = Array.from(document.querySelectorAll(
+                        '.MuiAccordion-root a, .MuiAccordion-root .MuiListItem-root, .MuiAccordionDetails-root a, .MuiAccordionDetails-root .MuiListItem-root, .MuiAccordionDetails-root > div, a.MuiListItem-root, .MuiListItem-root'
+                    )).filter(el => {
+                        const t = (el.innerText || '').trim();
+                        return t.length > 2 && t.length < 160 && !t.toLowerCase().includes('reading materials') && !t.toLowerCase().includes('challenge');
+                    });
+
+                    for (const row of candidateRows) {
+                        const rawText = row.innerText.trim();
+                        const titleLine = rawText.split('\\n')[0].trim();
+
+                        // Skip if already in doneList
+                        if (doneList.some(d => titleLine.includes(d) || (d && d.includes(titleLine)))) continue;
+
+                        // Skip if parent submodule accordion is marked as "Completed"
+                        const accordion = row.closest('.MuiAccordion-root');
+                        if (accordion) {
+                            const accSummary = accordion.querySelector('.MuiAccordionSummary-root');
+                            if (accSummary && (accSummary.innerText || '').toLowerCase().includes('completed')) {
+                                continue;
+                            }
+                        }
+
+                        // Check if checked
+                        const cb = row.querySelector('input[type="checkbox"], .MuiCheckbox-root, [data-testid*="CheckBox"], [data-testid*="Check"], span[aria-label*="complete"]');
+                        const isChecked = row.innerHTML.includes('Mui-checked') ||
+                                          row.querySelector('[data-testid="CheckBoxIcon"]') !== null ||
+                                          row.querySelector('[data-testid*="Check"]') !== null ||
+                                          row.getAttribute('aria-checked') === 'true' ||
+                                          row.classList.contains('completed') ||
+                                          row.innerText.includes('Completed') ||
+                                          (cb && (cb.checked || cb.getAttribute('aria-label') === 'Mark as incomplete'));
+
+                        if (!isChecked) {
+                            return {
+                                text: titleLine,
+                                href: row.href || (row.querySelector('a') ? row.querySelector('a').href : null)
+                            };
+                        }
+                    }
+                    return null;
+                }""", list(self.completed_activities))
+
+                if uncompleted_item:
+                    self.current_activity_name = uncompleted_item['text']
+                    print(f"[OK] Found Uncompleted Submodule Topic: {self.current_activity_name}")
+                    clicked = await self.bytexl_page.evaluate("""(name) => {
+                        const links = Array.from(document.querySelectorAll('.MuiAccordion-root a, .MuiAccordion-root .MuiListItem-root, a, .MuiListItem-root, [role="button"]'));
+                        const target = links.find(l => (l.innerText || '').includes(name));
+                        if (target) {
+                            const linkText = target.querySelector('.MuiListItemText-root') || target;
+                            linkText.click();
+                            return true;
+                        }
+                        return false;
+                    }""", self.current_activity_name)
+                    if not clicked and uncompleted_item.get('href'):
+                        await self.bytexl_page.goto(uncompleted_item['href'])
+                    await asyncio.sleep(4)
                     continue
                 else:
-                    # Check for Next Unit
-                    has_next_unit = await self.check_and_click_next_unit(active_page)
-                    if has_next_unit:
-                        print("[OK] All submodules in this unit complete! Advancing: 'Go To Next Unit'...")
+                    # Check for "Go To Next Unit" before returning to dashboard
+                    next_unit = await self.bytexl_page.evaluate("""() => {
+                        const btn = Array.from(document.querySelectorAll('button, a')).find(b => {
+                            const txt = (b.innerText || '').toLowerCase();
+                            return txt.includes('go to next unit') || txt.includes('next unit');
+                        });
+                        if (btn) {
+                            btn.click();
+                            return true;
+                        }
+                        return false;
+                    }""")
+                    if next_unit:
+                        print("[OK] All submodules in this unit completed! Advancing to Next Unit...")
                         await asyncio.sleep(4)
                         continue
 
-                    # Check for Back to Course
-                    has_back = await self.check_and_click_back_to_course(active_page)
-                    if has_back:
-                        print("[*] Unit finished! Returning to Units & Chapters list...")
-                        await asyncio.sleep(3.5)
-                        continue
+                    print("[OK] All Topics, Quizzes and Labs in this module are completed! Returning to My Courses...")
+                    await self.bytexl_page.goto("https://app.bytexl.ai/courses")
+                    await asyncio.sleep(4)
+                    if len(self.completed_activities) > 0:
+                        print("[OK] All Topics, Quizzes and Labs in this module are completed! Returning to My Courses...")
+                        await self.bytexl_page.goto("https://app.bytexl.ai/courses")
+                        await asyncio.sleep(4)
+                    else:
+                        print("[*] No uncompleted items found on this screen. Checking course status...")
+                        await asyncio.sleep(3)
+                    continue
 
-                    # Consult Gemini Brain
-                    if brain.has_key():
-                        shot_bytes = await self.take_page_screenshot(active_page)
-                        dec = brain.decide_navigation(active_page.url, await active_page.title(),
-                                                     await self.get_visible_buttons(active_page),
-                                                     await self.get_visible_headings(active_page),
-                                                     screenshot_bytes=shot_bytes)
-                        if dec.get("action") == "click_button" and dec.get("target_button_text"):
-                            target = dec.get("target_button_text")
-                            print(f"[🧠] AI Brain Decision: {dec.get('reason')} -> Clicking '{target}'")
-                            await self.click_button_reliably(active_page, target)
-                            await asyncio.sleep(4)
-                            continue
+            # Check if on My Courses page (`/courses`)
+            if current_url.rstrip("/").endswith("/courses"):
+                print("\n[*] On My Courses dashboard. Checking completion percentages...")
+                target_course = await self.bytexl_page.evaluate("""() => {
+                    // Find course cards
+                    const cards = Array.from(document.querySelectorAll('.MuiCard-root, .MuiPaper-root, .MuiBox-root')).filter(c => {
+                        return c.innerText && (c.innerText.includes('COMPLETION') || c.innerText.includes('Continue learning') || c.innerText.includes('Start learning'));
+                    });
 
-                    print("[OK] 🎉 All topics, quizzes, and labs in this unit are completed!")
-                    break
+                    for (const card of cards) {
+                        const txt = card.innerText;
+                        const match = txt.match(/COMPLETION[\\s\\S]*?(\\d+)%/i) || txt.match(/(\\d+)%[\\s\\S]*?COMPLETION/i);
+                        const pct = match ? parseInt(match[1]) : 0;
 
-            # Handle UNITS_LIST State ("Units and Chapters")
-            if current_state == "UNITS_LIST":
-                print("[*] Units & Chapters page detected. Finding uncompleted unit...")
+                        // Target courses with completion < 100%
+                        if (pct < 100) {
+                            const titleEl = card.querySelector('h3, h4, h5, h6, .MuiTypography-h6, .MuiTypography-h5');
+                            const btn = card.querySelector('button, a');
+                            return {
+                                title: titleEl ? titleEl.innerText.trim() : "Unknown Course",
+                                percentage: pct,
+                                btnText: btn ? btn.innerText.trim() : null
+                            };
+                        }
+                    }
+                    return null;
+                }""")
 
-                unit_res = await self.find_and_click_uncompleted_unit(active_page)
-                if unit_res.get("clicked"):
-                    unit_title = unit_res.get("title", "Unit")
-                    print(f"[OK] 🚀 Clicked 'Continue Learning' on Unit: '{unit_title}'! Loading...")
+                if target_course:
+                    print(f"[OK] Selecting Course: {target_course['title']} ({target_course['percentage']}% completed)")
+                    await self.bytexl_page.evaluate("""(title) => {
+                        const cards = Array.from(document.querySelectorAll('.MuiCard-root, .MuiPaper-root, .MuiBox-root'));
+                        for (const card of cards) {
+                            if (card.innerText.includes(title)) {
+                                const btn = card.querySelector('button, a');
+                                if (btn) btn.click();
+                                break;
+                            }
+                        }
+                    }""", target_course['title'])
                     await asyncio.sleep(4)
                     continue
                 else:
-                    # Standard selector didn't find button; consult Gemini Brain with screenshot
-                    if brain.has_key():
-                        print("[🧠] Consulting Gemini AI Brain with screen screenshot to find uncompleted unit...")
-                        shot_bytes = await self.take_page_screenshot(active_page)
-                        dec = brain.decide_navigation(active_page.url, await active_page.title(),
-                                                     await self.get_visible_buttons(active_page),
-                                                     await self.get_visible_headings(active_page),
-                                                     screenshot_bytes=shot_bytes)
-                        print(f"[🧠] AI Brain Analysis: {dec.get('reason')}")
-                        if dec.get("action") == "click_button" and dec.get("target_button_text"):
-                            target = dec.get("target_button_text")
-                            clicked = await self.click_button_reliably(active_page, target)
-                            if clicked:
-                                await asyncio.sleep(4)
-                                continue
-
-                    print("[OK] 🎉 All units on the Units & Chapters page are completed!")
+                    print("[OK] All courses are 100% completed! Congratulations!")
                     break
-
-            # Handle COURSES_CATALOG State
-            if current_state == "COURSES_CATALOG":
-                print("[*] Entering Course from Catalog...")
-                entered = await self.handle_courses_catalog(active_page, target_course)
-                if entered:
-                    await asyncio.sleep(4)
-                    continue
-                else:
-                    print("[*] All courses appear completed or catalog search finished.")
-                    break
-
-            # Handle UNKNOWN State (Gemini Vision Self-Healing)
-            if current_state == "UNKNOWN":
-                print(f"[*] Page state unrecognized ({active_page.url[:60]}). Consulting Gemini Brain...")
-
-                if brain.has_key():
-                    shot_bytes = await self.take_page_screenshot(active_page)
-                    buttons = await self.get_visible_buttons(active_page)
-                    headings = await self.get_visible_headings(active_page)
-                    dec = brain.decide_navigation(active_page.url, await active_page.title(),
-                                                 buttons, headings, screenshot_bytes=shot_bytes)
-                    print(f"[🧠] AI Brain Decision: {dec.get('reason')} -> Action: {dec.get('action')} on '{dec.get('target_button_text')}'")
-
-                    if dec.get("action") == "click_button" and dec.get("target_button_text"):
-                        await self.click_button_reliably(active_page, dec.get("target_button_text"))
-                        await asyncio.sleep(3.5)
-                        continue
-                    elif dec.get("action") == "mark_complete":
-                        await self.handle_theory_reading(active_page)
-                        continue
-                    elif dec.get("action") == "all_completed":
-                        print("[OK] 🎉 AI Brain verified: All course activities are completed!")
+                    has_cards = await self.bytexl_page.evaluate("""() => {
+                        return Array.from(document.querySelectorAll('.MuiCard-root, .MuiPaper-root, .MuiBox-root')).some(c => {
+                            return c.innerText && (c.innerText.includes('COMPLETION') || c.innerText.includes('Continue learning') || c.innerText.includes('Start learning'));
+                        });
+                    }""")
+                    if has_cards:
+                        print("[OK] All courses are 100% completed! Congratulations!")
                         break
+                    else:
+                        print("[!] No course cards detected on /courses page yet. Retrying...")
+                        await asyncio.sleep(3)
+                        continue
 
-                if stuck_counter >= 3:
-                    print("[⚠️] Agent remained on unknown page. Returning to /courses catalog...")
-                    try:
-                        await active_page.goto("https://app.bytexl.ai/courses")
-                        await asyncio.sleep(3.5)
-                    except Exception:
-                        pass
-                else:
-                    await asyncio.sleep(3)
-                continue
-
-        print("\n" + "="*60)
-        print(f"[OK] Master loop finished. Activities completed: {activities_completed}")
-        print("="*60)
-        if self.browser:
-            try:
-                await self.browser.close()
-            except Exception:
-                pass
-        if self.playwright:
-            try:
-                await self.playwright.stop()
-            except Exception:
-                pass
+            print("[*] Monitoring navigation state. Sleeping 3s...")
+            await asyncio.sleep(3)
 
 if __name__ == "__main__":
     import argparse
