@@ -393,16 +393,19 @@ class MasterByteXLAgent:
             self.port = free_p
             print(f"[*] Port 9222 in use by another browser. Using port {self.port} for {pref.capitalize()}...")
 
-        exe = find_installed_browser(pref)
-        proc_name = os.path.basename(exe)
-        b_label = proc_name.replace(".exe", "").capitalize()
+        desktop = os.path.join(os.environ.get("USERPROFILE", ""), "Desktop")
+        brave_shortcut = os.path.join(desktop, "Brave (ByteXL Agent Ready).lnk")
 
-        # If browser process is running without debugging:
-        # DO NOT kill it! Launch an automation profile window alongside it so existing tabs remain untouched!
-        if is_browser_process_running(proc_name):
-            print(f"[*] 💡 {b_label} is running. Launching automation window on port {self.port} (your existing tabs remain open untouched)...")
-            launch_browser_on_port(self.port, pref, use_default_profile=False)
+        if (pref == "auto" or "brave" in pref.lower()) and os.path.exists(brave_shortcut):
+            print("[*] 🚀 Using Desktop shortcut: 'Brave (ByteXL Agent Ready)'...")
+            try:
+                os.startfile(brave_shortcut)
+            except Exception:
+                launch_browser_on_port(self.port, "brave", use_default_profile=True)
         else:
+            exe = find_installed_browser(pref)
+            proc_name = os.path.basename(exe)
+            b_label = proc_name.replace(".exe", "").capitalize()
             print(f"[*] Launching {b_label} browser with remote debugging on port {self.port} (all logins preserved)...")
             launch_browser_on_port(self.port, pref, use_default_profile=True)
 

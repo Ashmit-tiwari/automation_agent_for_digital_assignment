@@ -428,17 +428,22 @@ class AutonomousByteXLAgent:
             self.ctrl.cdp_port = target_port
             self.ctrl.log(f"Port 9222 is in use by another browser. Using port {target_port} for {pref.capitalize()}...", "info")
 
-        # Launch preferred browser
-        exe = find_installed_browser(pref)
-        proc_name = os.path.basename(exe)
-        b_label = proc_name.replace(".exe", "").capitalize()
+        # 3. Check for Desktop shortcut "Brave (ByteXL Agent Ready).lnk"
+        desktop = os.path.join(os.environ.get("USERPROFILE", ""), "Desktop")
+        brave_shortcut = os.path.join(desktop, "Brave (ByteXL Agent Ready).lnk")
 
-        # If browser is currently running without remote debugging:
-        # DO NOT kill it! Launch an automation profile window alongside it so the user's existing browser stays open untouched!
-        if is_browser_process_running(proc_name):
-            self.ctrl.log(f"💡 {b_label} is running without port {target_port}. Starting automation window (Tip: Use Desktop shortcut 'Brave (ByteXL Agent Ready)' to keep all your tabs & logins)...", "info")
-            launch_browser_on_port(target_port, pref, use_default_profile=False)
+        if (pref == "auto" or "brave" in pref.lower()) and os.path.exists(brave_shortcut):
+            if is_browser_process_running("brave.exe"):
+                self.ctrl.log("💡 Brave is currently open. If remote debugging was not active at startup, close Brave and open it via 'Brave (ByteXL Agent Ready)'.", "info")
+            self.ctrl.log("🚀 Using Desktop shortcut: 'Brave (ByteXL Agent Ready)'...", "info")
+            try:
+                os.startfile(brave_shortcut)
+            except Exception:
+                launch_browser_on_port(target_port, "brave", use_default_profile=True)
         else:
+            exe = find_installed_browser(pref)
+            proc_name = os.path.basename(exe)
+            b_label = proc_name.replace(".exe", "").capitalize()
             self.ctrl.log(f"Launching {b_label} with remote debugging on port {target_port} (all logins preserved)...", "info")
             launch_browser_on_port(target_port, pref, use_default_profile=True)
 

@@ -25,7 +25,7 @@ def create_shortcut():
         print("[!] Brave executable not found on system.")
         return False
 
-    flags = "--remote-debugging-port=9222 --remote-allow-origins=* --restore-last-session --disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-renderer-backgrounding"
+    flags = '--remote-debugging-port=9222 --remote-allow-origins=* --restore-last-session --disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-renderer-backgrounding https://app.bytexl.ai/courses'
 
     vbs_script = f"""
 Set oWS = WScript.CreateObject("WScript.Shell")
@@ -57,3 +57,4 @@ oLink.Save
 
 if __name__ == "__main__":
     create_shortcut()
+
