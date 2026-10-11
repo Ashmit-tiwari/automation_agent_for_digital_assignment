@@ -771,21 +771,54 @@ class AutonomousByteXLAgent:
 
                 await self.take_screenshot(f"mcq_q{q_num}_{selected_letter}")
 
-            if mcq_data.get("isNextDisabled") or mcq_data.get("hasSubmit") or q_num >= 30:
-                self.ctrl.log("Final question of quiz reached. Submitting assessment...", "info")
-                await test_page.evaluate("""() => {
-                    const buttons = Array.from(document.querySelectorAll('button'));
-                    const sub = buttons.find(b => {
-                        const txt = (b.innerText || '').toLowerCase();
-                        return (txt.includes('submit') || txt.includes('finish') || txt.includes('end test')) && !b.disabled;
-                    });
-                    if (sub) {
-                        sub.click();
-                        sub.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-                    }
-                }""")
-                await asyncio.sleep(1.5)
+                # Wait for ByteXL to register answer and dismiss toast
+                await asyncio.sleep(1.2)
 
+            # Evaluate navigation buttons dynamically AFTER option is selected
+            nav_info = await test_page.evaluate("""() => {
+                const buttons = Array.from(document.querySelectorAll('button, a, [role="button"]'));
+
+                // 1. Check for enabled Next button
+                const nextBtn = buttons.find(b => {
+                    const txt = (b.innerText || '').trim().toLowerCase();
+                    return (txt === 'next' || txt === 'next >' || txt.includes('next')) && !b.disabled;
+                });
+                if (nextBtn) {
+                    nextBtn.scrollIntoView({ behavior: 'auto', block: 'center' });
+                    nextBtn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+                    nextBtn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+                    nextBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                    nextBtn.click();
+                    return { action: "NEXT_CLICKED" };
+                }
+
+                // 2. Check for Submit / Finish / End Test button (last question)
+                const subBtn = buttons.find(b => {
+                    const txt = (b.innerText || '').trim().toLowerCase();
+                    return (txt.includes('submit') || txt.includes('finish') || txt.includes('end test') || txt.includes('complete test')) && !b.disabled;
+                });
+                if (subBtn) {
+                    subBtn.scrollIntoView({ behavior: 'auto', block: 'center' });
+                    subBtn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+                    subBtn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+                    subBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                    subBtn.click();
+                    return { action: "SUBMIT_CLICKED" };
+                }
+
+                return { action: "NONE" };
+            }""")
+
+            action = nav_info.get("action") if nav_info else "NONE"
+
+            if action == "NEXT_CLICKED":
+                self.ctrl.log(f"Answer submitted for Q{q_num}. Advanced to next question.", "info")
+                await asyncio.sleep(1.5)
+                continue
+
+            elif action == "SUBMIT_CLICKED":
+                self.ctrl.log("Final question reached. Submitting assessment...", "info")
+                await asyncio.sleep(1.5)
                 await test_page.evaluate("""() => {
                     const confirmBtns = Array.from(document.querySelectorAll('.MuiDialog-root button, .MuiModal-root button, [role="dialog"] button, button')).filter(b => {
                         const txt = (b.innerText || '').toLowerCase();
@@ -795,32 +828,45 @@ class AutonomousByteXLAgent:
                         confirmBtns[confirmBtns.length - 1].click();
                     }
                 }""")
-                await asyncio.sleep(2)
+                await asyncio.sleep(2.5)
                 break
 
-            clicked_next = await test_page.evaluate("""() => {
-                const buttons = Array.from(document.querySelectorAll('button'));
-                const next = buttons.find(b => (b.innerText || '').toLowerCase().includes('next') && !b.disabled);
-                if (next) {
-                    next.click();
-                    next.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-                    return true;
-                }
-                return false;
-            }""")
-            if not clicked_next:
-                break
-            await asyncio.sleep(1.5)
+            else:
+                # Retry after 1.5s in case save request is in flight
+                await asyncio.sleep(1.5)
+                retry_action = await test_page.evaluate("""() => {
+                    const buttons = Array.from(document.querySelectorAll('button, a, [role="button"]'));
+                    const nextBtn = buttons.find(b => {
+                        const txt = (b.innerText || '').trim().toLowerCase();
+                        return (txt === 'next' || txt === 'next >' || txt.includes('next')) && !b.disabled;
+                    });
+                    if (nextBtn) {
+                        nextBtn.click();
+                        return "NEXT_CLICKED";
+                    }
+                    const subBtn = buttons.find(b => {
+                        const txt = (b.innerText || '').trim().toLowerCase();
+                        return (txt.includes('submit') || txt.includes('finish') || txt.includes('end test')) && !b.disabled;
+                    });
+                    if (subBtn) {
+                        subBtn.click();
+                        return "SUBMIT_CLICKED";
+                    }
+                    return "NONE";
+                }""")
+                if retry_action == "NEXT_CLICKED":
+                    self.ctrl.log(f"Answer submitted for Q{q_num}. Advanced to next question.", "info")
+                    await asyncio.sleep(1.5)
+                    continue
+                elif retry_action == "SUBMIT_CLICKED":
+                    self.ctrl.log("Assessment completed. Submitted successfully!", "success")
+                    await asyncio.sleep(2)
+                    break
+                else:
+                    self.ctrl.log(f"Assessment concluded at question {q_num}.", "info")
+                    break
 
-        self.ctrl.log("Cutting quiz tab and moving to next topic...", "info")
-        for p in list(self.context.pages):
-            if "/test/" in p.url:
-                try:
-                    await p.close()
-                except Exception:
-                    pass
-
-        await self.bytexl_page.bring_to_front()
+        self.ctrl.log("MCQ Quiz finished successfully.", "success")
         await asyncio.sleep(2)
 
         # Advance if on landing page
@@ -1232,45 +1278,69 @@ class AutonomousByteXLAgent:
         if not pages:
             return self.bytexl_page, "default"
 
-        # 1. Prioritize active quiz / test / assessment
+        valid_pages = []
         for p in pages:
             try:
+                if p.is_closed():
+                    continue
                 u = p.url.lower()
-                if "/test/" in u or "/assessment/" in u:
+                if "chrome-error://" in u or "chromewebdata" in u or "gemini.google.com" in u:
+                    continue
+                valid_pages.append(p)
+            except Exception:
+                pass
+
+        if not valid_pages:
+            return self.bytexl_page, "default"
+
+        # 1. Prioritize active quiz / test / assessment (by URL or by DOM)
+        for p in valid_pages:
+            try:
+                u = p.url.lower()
+                if "/test/" in u or "/assessment/" in u or "/quiz/" in u:
+                    return p, "test"
+                has_test_dom = await p.evaluate("() => !!document.querySelector('[role=\"radiogroup\"], .MuiRadioGroup-root, .monaco-editor')")
+                if has_test_dom:
                     return p, "test"
             except Exception:
                 pass
 
-        # 2. Prioritize learning module or topic
-        for p in pages:
+        # 2. Prioritize learning module or topic (exclude /login)
+        for p in valid_pages:
             try:
                 u = p.url.lower()
-                if "/module/" in u or "/topic/" in u:
+                if ("/module/" in u or "/topic/" in u) and "/login" not in u:
                     return p, "learning"
             except Exception:
                 pass
 
-        # 3. Prioritize course units / catalog
-        for p in pages:
+        # 3. Prioritize course units / catalog (exclude /login)
+        for p in valid_pages:
             try:
                 u = p.url.lower()
-                if "bytexl" in u and "/courses" in u:
+                if "bytexl" in u and "/courses" in u and "/login" not in u:
                     return p, "courses"
             except Exception:
                 pass
 
-        # 4. Any bytexl page
-        for p in pages:
+        # 4. Any bytexl page that is NOT /login
+        for p in valid_pages:
             try:
                 u = p.url.lower()
-                if "bytexl" in u:
+                if "bytexl" in u and "/login" not in u and "/signin" not in u:
                     return p, "bytexl"
             except Exception:
                 pass
 
-        if self.bytexl_page and not self.bytexl_page.is_closed():
-            return self.bytexl_page, "default"
-        return pages[-1], "default"
+        # 5. Fallback: if only login page exists
+        for p in valid_pages:
+            try:
+                if "bytexl" in p.url.lower():
+                    return p, "bytexl"
+            except Exception:
+                pass
+
+        return valid_pages[-1], "default"
 
     async def classify_page_state(self, page) -> Dict[str, Any]:
         """Classifies the current page into a recognized operational state."""
@@ -1282,16 +1352,26 @@ class AutonomousByteXLAgent:
                 const url = window.location.href.toLowerCase();
                 const bodyText = (document.body ? document.body.innerText : '').toLowerCase();
 
-                // 1. Login required
-                if (url.includes('/login') || url.includes('/signin') || !!document.querySelector('input[type="password"]')) {
-                    return { state: "LOGIN" };
-                }
-
-                // 2. Active Test / Assessment
+                // 1. Active Test / Assessment FIRST! (A page with questions/radios is NEVER a login page)
                 const hasRadios = !!document.querySelector('[role="radiogroup"], .MuiRadioGroup-root, [role="radio"]');
                 const hasMonaco = !!document.querySelector('.monaco-editor, textarea#code');
-                if (url.includes('/test/') || url.includes('/assessment/') || hasRadios || hasMonaco) {
+                const hasScoreDiff = bodyText.includes('difficulty:') || bodyText.includes('score:') || bodyText.includes('answer submitted');
+                if (url.includes('/test/') || url.includes('/assessment/') || url.includes('/quiz/') || hasRadios || hasMonaco || (hasScoreDiff && hasRadios)) {
                     return { state: "TEST_ACTIVE", isCoding: hasMonaco, isMCQ: hasRadios };
+                }
+
+                // 2. Login required ONLY if on actual login URL or visible login form (and NOT a test)
+                const isLoginUrl = url.includes('/login') || url.includes('/signin');
+                const visiblePassword = Array.from(document.querySelectorAll('input[type="password"]')).some(el => {
+                    const rect = el.getBoundingClientRect();
+                    return rect.width > 0 && rect.height > 0;
+                });
+                const hasSignInBtn = Array.from(document.querySelectorAll('button, input[type="submit"]')).some(b => {
+                    const t = (b.innerText || b.value || '').toLowerCase();
+                    return t.includes('sign in') || t.includes('log in') || t.includes('login');
+                });
+                if ((isLoginUrl || (visiblePassword && hasSignInBtn)) && !hasRadios && !hasMonaco) {
+                    return { state: "LOGIN" };
                 }
 
                 // 3. Reading / Theory Topic
@@ -1865,12 +1945,9 @@ class AutonomousByteXLAgent:
                     completed_set.add(current_activity_name)
                 activities_completed += 1
 
-                # If test_page was a secondary popup tab, close it
-                if active_page != self.bytexl_page and len(self.context.pages) > 1:
-                    try:
-                        await active_page.close()
-                    except Exception:
-                        pass
+                # Keep active page reference healthy without force-closing
+                if active_page and not active_page.is_closed():
+                    self.bytexl_page = active_page
                 await asyncio.sleep(2)
 
                 course_page, _ = await self.get_active_page()

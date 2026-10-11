@@ -742,24 +742,54 @@ class MasterByteXLAgent:
 
                 await self.take_screenshot(f"mcq_q{q_num}_{selected_letter}")
 
-            # Check if this is the last question (Next is disabled, submit exists, or q_num >= 30)
-            if mcq_data.get("isNextDisabled") or mcq_data.get("hasSubmit") or q_num >= 30:
-                print("[*] Reached last question of MCQ quiz. Submitting assessment...")
-                # Check for Submit button
-                await test_page.evaluate("""() => {
-                    const buttons = Array.from(document.querySelectorAll('button'));
-                    const sub = buttons.find(b => {
-                        const txt = (b.innerText || '').toLowerCase();
-                        return (txt.includes('submit') || txt.includes('finish') || txt.includes('end test')) && !b.disabled;
-                    });
-                    if (sub) {
-                        sub.click();
-                        sub.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-                    }
-                }""")
-                await asyncio.sleep(1.5)
+                # Wait for ByteXL to register answer and dismiss toast
+                await asyncio.sleep(1.2)
 
-                # Confirm submission modal if one appears (e.g. "Confirm", "Yes", "End Test")
+            # Evaluate navigation buttons dynamically AFTER option is selected
+            nav_info = await test_page.evaluate("""() => {
+                const buttons = Array.from(document.querySelectorAll('button, a, [role="button"]'));
+
+                // 1. Check for enabled Next button
+                const nextBtn = buttons.find(b => {
+                    const txt = (b.innerText || '').trim().toLowerCase();
+                    return (txt === 'next' || txt === 'next >' || txt.includes('next')) && !b.disabled;
+                });
+                if (nextBtn) {
+                    nextBtn.scrollIntoView({ behavior: 'auto', block: 'center' });
+                    nextBtn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+                    nextBtn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+                    nextBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                    nextBtn.click();
+                    return { action: "NEXT_CLICKED" };
+                }
+
+                // 2. Check for Submit / Finish / End Test button (last question)
+                const subBtn = buttons.find(b => {
+                    const txt = (b.innerText || '').trim().toLowerCase();
+                    return (txt.includes('submit') || txt.includes('finish') || txt.includes('end test') || txt.includes('complete test')) && !b.disabled;
+                });
+                if (subBtn) {
+                    subBtn.scrollIntoView({ behavior: 'auto', block: 'center' });
+                    subBtn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+                    subBtn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+                    subBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                    subBtn.click();
+                    return { action: "SUBMIT_CLICKED" };
+                }
+
+                return { action: "NONE" };
+            }""")
+
+            action = nav_info.get("action") if nav_info else "NONE"
+
+            if action == "NEXT_CLICKED":
+                print(f"[OK] Answer submitted for Q{q_num}. Advanced to next question.")
+                await asyncio.sleep(1.5)
+                continue
+
+            elif action == "SUBMIT_CLICKED":
+                print("[*] Reached last question of MCQ quiz. Submitting assessment...")
+                await asyncio.sleep(1.5)
                 await test_page.evaluate("""() => {
                     const confirmBtns = Array.from(document.querySelectorAll('.MuiDialog-root button, .MuiModal-root button, [role="dialog"] button, button')).filter(b => {
                         const txt = (b.innerText || '').toLowerCase();
@@ -769,23 +799,43 @@ class MasterByteXLAgent:
                         confirmBtns[confirmBtns.length - 1].click();
                     }
                 }""")
-                await asyncio.sleep(2)
+                await asyncio.sleep(2.5)
                 break
 
-            # Click Next
-            clicked_next = await test_page.evaluate("""() => {
-                const buttons = Array.from(document.querySelectorAll('button'));
-                const next = buttons.find(b => (b.innerText || '').toLowerCase().includes('next') && !b.disabled);
-                if (next) {
-                    next.click();
-                    next.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-                    return true;
-                }
-                return false;
-            }""")
-            await asyncio.sleep(1.5)
-            if not clicked_next:
-                break
+            else:
+                # Retry after 1.5s in case save request is in flight
+                await asyncio.sleep(1.5)
+                retry_action = await test_page.evaluate("""() => {
+                    const buttons = Array.from(document.querySelectorAll('button, a, [role="button"]'));
+                    const nextBtn = buttons.find(b => {
+                        const txt = (b.innerText || '').trim().toLowerCase();
+                        return (txt === 'next' || txt === 'next >' || txt.includes('next')) && !b.disabled;
+                    });
+                    if (nextBtn) {
+                        nextBtn.click();
+                        return "NEXT_CLICKED";
+                    }
+                    const subBtn = buttons.find(b => {
+                        const txt = (b.innerText || '').trim().toLowerCase();
+                        return (txt.includes('submit') || txt.includes('finish') || txt.includes('end test')) && !b.disabled;
+                    });
+                    if (subBtn) {
+                        subBtn.click();
+                        return "SUBMIT_CLICKED";
+                    }
+                    return "NONE";
+                }""")
+                if retry_action == "NEXT_CLICKED":
+                    print(f"[OK] Answer submitted for Q{q_num}. Advanced to next question.")
+                    await asyncio.sleep(1.5)
+                    continue
+                elif retry_action == "SUBMIT_CLICKED":
+                    print("[OK] Assessment completed. Submitted successfully!")
+                    await asyncio.sleep(2)
+                    break
+                else:
+                    print(f"[*] Assessment concluded at question {q_num}.")
+                    break
 
         print("[OK] MCQ Assessment finished.")
 
@@ -1223,8 +1273,16 @@ class MasterByteXLAgent:
         # Login Gatekeeper: Check if ByteXL is at login / signin screen
         is_login = await self.bytexl_page.evaluate("""() => {
             const url = window.location.href.toLowerCase();
+            const hasRadios = !!document.querySelector('[role="radiogroup"], .MuiRadioGroup-root, [role="radio"]');
+            const hasMonaco = !!document.querySelector('.monaco-editor, textarea#code');
+            if (hasRadios || hasMonaco || url.includes('/courses/') || url.includes('/module/') || url.includes('/topic/') || url.includes('/test/') || url.includes('/assessment/')) {
+                return false;
+            }
             if (url.includes('/login') || url.includes('/signin')) return true;
-            const hasPass = !!document.querySelector('input[type="password"]');
+            const hasPass = Array.from(document.querySelectorAll('input[type="password"]')).some(el => {
+                const rect = el.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+            });
             const hasSignIn = Array.from(document.querySelectorAll('button, input[type="submit"]')).some(b => {
                 const t = (b.innerText || b.value || '').toLowerCase();
                 return t.includes('sign in') || t.includes('log in') || t.includes('login');
@@ -1408,13 +1466,9 @@ class MasterByteXLAgent:
                 else:
                     await self.solve_mcq_test(test_page)
 
-                # Close test page if it is a secondary popup window
-                for p in list(self.context.pages):
-                    if p != self.bytexl_page and ("/test/" in p.url.lower() or "/assessment/" in p.url.lower()):
-                        try:
-                            await p.close()
-                        except Exception:
-                            pass
+                # Keep active page reference healthy without force-closing
+                if test_page and not test_page.is_closed():
+                    self.bytexl_page = test_page
                 await asyncio.sleep(2)
 
                 # Post-Activity: Tick the side completion box on the sidebar/accordion!
