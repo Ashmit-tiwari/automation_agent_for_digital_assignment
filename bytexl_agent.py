@@ -236,10 +236,21 @@ def is_browser_process_running(proc_name):
 PAGE_VISIBILITY_SHIM = """
 (() => {
     try {
+        const u = window.location.href.toLowerCase();
+        // 1. NEVER interfere with login, signin, or SSO authentication pages!
+        if (u.includes('/login') || u.includes('/signin') || u.includes('accounts.google') || u.includes('login.microsoft') || u.includes('cloudflare')) {
+            return;
+        }
+
         if (window.__page_visibility_shim_active) return;
         window.__page_visibility_shim_active = true;
 
-        // 1. Permanent Visibility & Focus Property Overrides
+        // Mask navigator.webdriver so Cloudflare Turnstile and SSO auth treat this as genuine human browser
+        try {
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined, configurable: true });
+        } catch(e) {}
+
+        // 2. Permanent Visibility & Focus Property Overrides (prevents tab-switch warnings)
         const fakeProps = {
             hidden: { get: () => false, configurable: true },
             visibilityState: { get: () => 'visible', configurable: true },
@@ -253,8 +264,8 @@ PAGE_VISIBILITY_SHIM = """
             try { Object.defineProperty(Document.prototype, prop, desc); } catch(e) {}
         }
 
-        // 2. Intercept addEventListener to drop anti-cheat tab-switch & blur listeners
-        const blockEvents = ['visibilitychange', 'webkitvisibilitychange', 'blur', 'focusout', 'pagehide'];
+        // 3. Drop anti-cheat visibilitychange events ONLY (Do NOT block blur/focusout which form inputs require!)
+        const blockEvents = ['visibilitychange', 'webkitvisibilitychange'];
         try {
             const origWinAdd = window.addEventListener;
             window.addEventListener = function(type, listener, options) {
@@ -270,7 +281,6 @@ PAGE_VISIBILITY_SHIM = """
             };
         } catch(e) {}
 
-        // 3. Suppress blur, focusout, visibilitychange and pagehide in capturing phase
         const stopHandler = (e) => {
             try {
                 e.stopImmediatePropagation();
@@ -282,9 +292,6 @@ PAGE_VISIBILITY_SHIM = """
             try { document.addEventListener(ev, stopHandler, true); } catch(e) {}
         }
 
-        // 4. Block event handler properties (e.g. window.onblur = fn)
-        try { Object.defineProperty(window, 'onblur', { get: () => null, set: () => {}, configurable: true }); } catch(e) {}
-        try { Object.defineProperty(window, 'onpagehide', { get: () => null, set: () => {}, configurable: true }); } catch(e) {}
         try { Object.defineProperty(document, 'onvisibilitychange', { get: () => null, set: () => {}, configurable: true }); } catch(e) {}
 
         // 5. Continuous requestAnimationFrame ticker (runs at 60fps even when minimized)

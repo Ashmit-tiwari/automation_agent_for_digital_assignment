@@ -92,11 +92,6 @@ exit /b 1
 :check_running
 echo Selected Browser: %BNAME% (%TARGET_EXE%)
 echo.
-if not "%BROWSER_EXE_NAME%"=="" (
-    echo [*] Closing existing %BNAME% window so remote debugging can attach to your default profile...
-    taskkill /IM "%BROWSER_EXE_NAME%" /F >nul 2>&1
-    timeout /t 2 >nul
-)
 
 echo [*] Launching %BNAME% with remote debugging on port %PORT%...
 start "" "%TARGET_EXE%" %FLAGS% %URLS%
