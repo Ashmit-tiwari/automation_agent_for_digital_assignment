@@ -236,23 +236,72 @@ def is_browser_process_running(proc_name):
 PAGE_VISIBILITY_SHIM = """
 (() => {
     try {
-        Object.defineProperty(document, 'hidden', { get: () => false, configurable: true });
-        Object.defineProperty(document, 'visibilityState', { get: () => 'visible', configurable: true });
-        window.addEventListener('visibilitychange', (e) => e.stopImmediatePropagation(), true);
-        window.addEventListener('blur', (e) => e.stopImmediatePropagation(), true);
+        if (window.__page_visibility_shim_active) return;
+        window.__page_visibility_shim_active = true;
+
+        // 1. Permanent Visibility & Focus Property Overrides
+        const fakeProps = {
+            hidden: { get: () => false, configurable: true },
+            visibilityState: { get: () => 'visible', configurable: true },
+            webkitHidden: { get: () => false, configurable: true },
+            webkitVisibilityState: { get: () => 'visible', configurable: true },
+            hasFocus: { value: () => true, writable: true, configurable: true }
+        };
+
+        for (const [prop, desc] of Object.entries(fakeProps)) {
+            try { Object.defineProperty(document, prop, desc); } catch(e) {}
+            try { Object.defineProperty(Document.prototype, prop, desc); } catch(e) {}
+        }
+
+        // 2. Intercept addEventListener to drop anti-cheat tab-switch & blur listeners
+        const blockEvents = ['visibilitychange', 'webkitvisibilitychange', 'blur', 'focusout', 'pagehide'];
+        try {
+            const origWinAdd = window.addEventListener;
+            window.addEventListener = function(type, listener, options) {
+                if (blockEvents.includes(type)) return;
+                return origWinAdd.apply(this, arguments);
+            };
+        } catch(e) {}
+        try {
+            const origDocAdd = document.addEventListener;
+            document.addEventListener = function(type, listener, options) {
+                if (blockEvents.includes(type)) return;
+                return origDocAdd.apply(this, arguments);
+            };
+        } catch(e) {}
+
+        // 3. Suppress blur, focusout, visibilitychange and pagehide in capturing phase
+        const stopHandler = (e) => {
+            try {
+                e.stopImmediatePropagation();
+                e.stopPropagation();
+            } catch(err) {}
+        };
+        for (const ev of blockEvents) {
+            try { window.addEventListener(ev, stopHandler, true); } catch(e) {}
+            try { document.addEventListener(ev, stopHandler, true); } catch(e) {}
+        }
+
+        // 4. Block event handler properties (e.g. window.onblur = fn)
+        try { Object.defineProperty(window, 'onblur', { get: () => null, set: () => {}, configurable: true }); } catch(e) {}
+        try { Object.defineProperty(window, 'onpagehide', { get: () => null, set: () => {}, configurable: true }); } catch(e) {}
+        try { Object.defineProperty(document, 'onvisibilitychange', { get: () => null, set: () => {}, configurable: true }); } catch(e) {}
+
+        // 5. Continuous requestAnimationFrame ticker (runs at 60fps even when minimized)
         if (!window.__raf_shim_active) {
             window.__raf_shim_active = true;
-            const originalRAF = window.requestAnimationFrame;
-            let lastTime = 0;
+            let lastTime = performance.now();
             window.requestAnimationFrame = function(callback) {
-                if (document.visibilityState === 'visible' && !document.hidden) {
-                    try { return originalRAF(callback); } catch(e) {}
-                }
-                const currTime = new Date().getTime();
-                const timeToCall = Math.max(0, 16 - (currTime - lastTime));
-                const id = window.setTimeout(() => callback(currTime + timeToCall), timeToCall);
+                const currTime = performance.now();
+                const timeToCall = Math.max(0, 16.6 - (currTime - lastTime));
+                const id = window.setTimeout(() => {
+                    try { callback(performance.now()); } catch(e) {}
+                }, timeToCall);
                 lastTime = currTime + timeToCall;
                 return id;
+            };
+            window.cancelAnimationFrame = function(id) {
+                clearTimeout(id);
             };
         }
     } catch(e) {}
@@ -270,7 +319,8 @@ def launch_browser_on_port(port, preferred=None, use_default_profile=True):
         "--disable-background-timer-throttling",
         "--disable-backgrounding-occluded-windows",
         "--disable-renderer-backgrounding",
-        "--disable-features=CalculateNativeWinOcclusion,IntensiveWakeUpThrottling,ThrottleDisplayNoneAndVisibilityHiddenCrossOriginIframes",
+        "--disable-features=CalculateNativeWinOcclusion,IntensiveWakeUpThrottling,ThrottleDisplayNoneAndVisibilityHiddenCrossOriginIframes,ThrottleJavascript",
+        "--run-all-compositor-stages-before-draw",
         "--disable-ipc-flooding-protection",
         "--disable-hang-monitor",
         "https://app.bytexl.ai/courses",
@@ -1529,53 +1579,66 @@ class MasterByteXLAgent:
                 if has_curriculum:
                     print("[*] 🎯 Module curriculum detected directly on course page! Proceeding to topics...")
                 else:
-                    print("\n[*] On Units & Chapters page. Finding uncompleted unit with 'Continue Learning'...")
+                    print("\n[*] On Units & Chapters page. Finding uncompleted unit...")
                     unit_res = await self.bytexl_page.evaluate("""() => {
-                        const allButtons = Array.from(document.querySelectorAll('button, a'));
-                        
-                        // 1. Exact match for blue button
-                        let actionBtn = allButtons.find(b => {
-                            const txt = (b.innerText || '').trim().toLowerCase();
-                            return (txt === 'continue learning' || txt === 'start learning' || txt === 'resume');
+                        const cards = Array.from(document.querySelectorAll('.MuiPaper-root, .MuiCard-root, div[class*="UnitCard"], div[class*="MuiBox-root"]')).filter(c => {
+                            const t = (c.innerText || '').toLowerCase();
+                            return (t.includes('chapter') || t.includes('challenge')) && !t.includes('units and chapters') && !t.includes('how is my course graded');
                         });
 
-                        // 2. Fallback: MuiButton-containedPrimary
-                        if (!actionBtn) {
-                            actionBtn = document.querySelector('button.MuiButton-containedPrimary');
-                        }
-
-                        // 3. Fallback: contains continue learning without completed
-                        if (!actionBtn) {
-                            actionBtn = allButtons.find(b => {
+                        // 1. Look for a unit card with an explicit action button
+                        for (const card of cards) {
+                            const btn = Array.from(card.querySelectorAll('button, a, [role="button"], div[class*="button" i]')).find(b => {
                                 const txt = (b.innerText || '').trim().toLowerCase();
-                                return (txt.includes('continue learning') || txt.includes('start learning')) && !txt.includes('completed');
+                                return (txt.includes('continue learning') || txt.includes('start learning') || txt.includes('resume')) && !b.disabled;
                             });
+                            if (btn) {
+                                const lines = card.innerText.split(/\\r?\\n/).map(l => l.trim()).filter(Boolean);
+                                const title = lines.find(l => !l.toLowerCase().includes('learning') && !l.toLowerCase().includes('completed') && !l.toLowerCase().includes('chapter') && !l.toLowerCase().includes('challenge')) || 'Unit';
+                                btn.scrollIntoView({ behavior: 'auto', block: 'center' });
+                                btn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+                                btn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+                                btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                                btn.click();
+                                return { clicked: true, title: title, all_completed: false };
+                            }
                         }
 
-                        if (actionBtn) {
-                            let card = actionBtn.closest('.MuiPaper-root, .MuiCard-root, .MuiBox-root, [class*="MuiButton-outlined"]') || actionBtn.parentElement;
-                            let unitTitle = 'Unit';
-                            if (card) {
-                                const lines = card.innerText.split('\\n').map(l => l.trim()).filter(Boolean);
-                                const tLine = lines.find(l => !l.toLowerCase().includes('continue learning') && !l.toLowerCase().includes('start learning') && !l.toLowerCase().includes('completed') && !l.toLowerCase().includes('challenge') && !l.toLowerCase().includes('chapter'));
-                                if (tLine) unitTitle = tLine;
-                            }
-                            actionBtn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-                            actionBtn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
-                            actionBtn.click();
-                            return { clicked: true, title: unitTitle };
+                        // 2. Look for an uncompleted unit card (one without "Completed")
+                        const uncompletedCard = cards.find(card => {
+                            const txt = (card.innerText || '').toLowerCase();
+                            return !txt.includes('completed');
+                        });
+
+                        if (uncompletedCard) {
+                            const lines = uncompletedCard.innerText.split(/\\r?\\n/).map(l => l.trim()).filter(Boolean);
+                            const title = lines.find(l => !l.toLowerCase().includes('completed') && !l.toLowerCase().includes('chapter') && !l.toLowerCase().includes('challenge')) || 'Unit';
+                            const clickTarget = uncompletedCard.querySelector('button, a, [role="button"], h3, h4, h5, h6, .MuiTypography-root') || uncompletedCard;
+                            clickTarget.scrollIntoView({ behavior: 'auto', block: 'center' });
+                            clickTarget.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+                            clickTarget.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+                            clickTarget.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                            clickTarget.click();
+                            return { clicked: true, title: title, all_completed: false };
                         }
-                        return { clicked: false };
+
+                        const allDone = cards.length > 0 && cards.every(c => (c.innerText || '').toLowerCase().includes('completed'));
+                        return { clicked: false, all_completed: allDone };
                     }""")
 
                     if unit_res.get("clicked"):
-                        print(f"[OK] Clicked 'Continue Learning' on: {unit_res.get('title')}")
+                        print(f"[OK] Selected Unit: {unit_res.get('title')}")
                         await asyncio.sleep(4)
                         try:
                             await self.bytexl_page.wait_for_url(lambda u: "/module/" in u.lower(), timeout=8000)
                             print(f"[OK] Entered Module view: '{unit_res.get('title')}'!")
                         except Exception:
                             await asyncio.sleep(4)
+                        continue
+                    elif unit_res.get("all_completed"):
+                        print("[OK] 🎉 All units on Units & Chapters page are 100% completed! Returning to My Courses...")
+                        await self.bytexl_page.goto("https://app.bytexl.ai/courses")
+                        await asyncio.sleep(3)
                         continue
 
             # Check if on Module view / curriculum page
@@ -1641,6 +1704,10 @@ class MasterByteXLAgent:
                         const target = links.find(l => (l.innerText || '').includes(name));
                         if (target) {
                             const linkText = target.querySelector('.MuiListItemText-root') || target;
+                            linkText.scrollIntoView({ behavior: 'auto', block: 'center' });
+                            linkText.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+                            linkText.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+                            linkText.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
                             linkText.click();
                             return true;
                         }

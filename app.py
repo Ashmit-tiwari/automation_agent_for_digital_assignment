@@ -241,23 +241,72 @@ def is_browser_process_running(proc_name):
 PAGE_VISIBILITY_SHIM = """
 (() => {
     try {
-        Object.defineProperty(document, 'hidden', { get: () => false, configurable: true });
-        Object.defineProperty(document, 'visibilityState', { get: () => 'visible', configurable: true });
-        window.addEventListener('visibilitychange', (e) => e.stopImmediatePropagation(), true);
-        window.addEventListener('blur', (e) => e.stopImmediatePropagation(), true);
+        if (window.__page_visibility_shim_active) return;
+        window.__page_visibility_shim_active = true;
+
+        // 1. Permanent Visibility & Focus Property Overrides
+        const fakeProps = {
+            hidden: { get: () => false, configurable: true },
+            visibilityState: { get: () => 'visible', configurable: true },
+            webkitHidden: { get: () => false, configurable: true },
+            webkitVisibilityState: { get: () => 'visible', configurable: true },
+            hasFocus: { value: () => true, writable: true, configurable: true }
+        };
+
+        for (const [prop, desc] of Object.entries(fakeProps)) {
+            try { Object.defineProperty(document, prop, desc); } catch(e) {}
+            try { Object.defineProperty(Document.prototype, prop, desc); } catch(e) {}
+        }
+
+        // 2. Intercept addEventListener to drop anti-cheat tab-switch & blur listeners
+        const blockEvents = ['visibilitychange', 'webkitvisibilitychange', 'blur', 'focusout', 'pagehide'];
+        try {
+            const origWinAdd = window.addEventListener;
+            window.addEventListener = function(type, listener, options) {
+                if (blockEvents.includes(type)) return;
+                return origWinAdd.apply(this, arguments);
+            };
+        } catch(e) {}
+        try {
+            const origDocAdd = document.addEventListener;
+            document.addEventListener = function(type, listener, options) {
+                if (blockEvents.includes(type)) return;
+                return origDocAdd.apply(this, arguments);
+            };
+        } catch(e) {}
+
+        // 3. Suppress blur, focusout, visibilitychange and pagehide in capturing phase
+        const stopHandler = (e) => {
+            try {
+                e.stopImmediatePropagation();
+                e.stopPropagation();
+            } catch(err) {}
+        };
+        for (const ev of blockEvents) {
+            try { window.addEventListener(ev, stopHandler, true); } catch(e) {}
+            try { document.addEventListener(ev, stopHandler, true); } catch(e) {}
+        }
+
+        // 4. Block event handler properties (e.g. window.onblur = fn)
+        try { Object.defineProperty(window, 'onblur', { get: () => null, set: () => {}, configurable: true }); } catch(e) {}
+        try { Object.defineProperty(window, 'onpagehide', { get: () => null, set: () => {}, configurable: true }); } catch(e) {}
+        try { Object.defineProperty(document, 'onvisibilitychange', { get: () => null, set: () => {}, configurable: true }); } catch(e) {}
+
+        // 5. Continuous requestAnimationFrame ticker (runs at 60fps even when minimized)
         if (!window.__raf_shim_active) {
             window.__raf_shim_active = true;
-            const originalRAF = window.requestAnimationFrame;
-            let lastTime = 0;
+            let lastTime = performance.now();
             window.requestAnimationFrame = function(callback) {
-                if (document.visibilityState === 'visible' && !document.hidden) {
-                    try { return originalRAF(callback); } catch(e) {}
-                }
-                const currTime = new Date().getTime();
-                const timeToCall = Math.max(0, 16 - (currTime - lastTime));
-                const id = window.setTimeout(() => callback(currTime + timeToCall), timeToCall);
+                const currTime = performance.now();
+                const timeToCall = Math.max(0, 16.6 - (currTime - lastTime));
+                const id = window.setTimeout(() => {
+                    try { callback(performance.now()); } catch(e) {}
+                }, timeToCall);
                 lastTime = currTime + timeToCall;
                 return id;
+            };
+            window.cancelAnimationFrame = function(id) {
+                clearTimeout(id);
             };
         }
     } catch(e) {}
@@ -276,7 +325,8 @@ def launch_browser_on_port(port, preferred=None, use_default_profile=True):
         "--disable-background-timer-throttling",
         "--disable-backgrounding-occluded-windows",
         "--disable-renderer-backgrounding",
-        "--disable-features=CalculateNativeWinOcclusion,IntensiveWakeUpThrottling,ThrottleDisplayNoneAndVisibilityHiddenCrossOriginIframes",
+        "--disable-features=CalculateNativeWinOcclusion,IntensiveWakeUpThrottling,ThrottleDisplayNoneAndVisibilityHiddenCrossOriginIframes,ThrottleJavascript",
+        "--run-all-compositor-stages-before-draw",
         "--disable-ipc-flooding-protection",
         "--disable-hang-monitor",
         "https://app.bytexl.ai/courses",
@@ -1296,39 +1346,47 @@ class AutonomousByteXLAgent:
             return {"state": "UNKNOWN", "error": str(e)}
 
     async def click_button_reliably(self, page, text: str) -> bool:
-        """Clicks an element by text using native Playwright events and JS fallback."""
+        """Clicks an element by text using fast DOM JS click first, with Playwright fallback."""
         clean = (text or "").strip()
         if not clean:
             return False
 
         try:
-            loc = page.locator(f'button:has-text("{clean}"), a:has-text("{clean}")').first
-            if await loc.count() > 0 and await loc.is_visible():
-                await loc.scroll_into_view_if_needed()
-                await loc.click(timeout=3000)
-                return True
-        except Exception:
-            pass
-
-        try:
-            return await page.evaluate("""(targetText) => {
+            clicked = await page.evaluate("""(targetText) => {
                 const targetLower = targetText.toLowerCase();
-                const all = Array.from(document.querySelectorAll('button, a, [role="button"], span.MuiButton-label'));
+                const all = Array.from(document.querySelectorAll('button, a, [role="button"], span.MuiButton-label, div[class*="button" i], [tabindex="0"]'));
                 const match = all.find(el => {
                     const t = (el.innerText || '').trim().toLowerCase();
-                    return t === targetLower || t.includes(targetLower);
+                    return t === targetLower;
+                }) || all.find(el => {
+                    const t = (el.innerText || '').trim().toLowerCase();
+                    return t.includes(targetLower);
                 });
                 if (match) {
                     const btn = match.closest('button, a, [role="button"]') || match;
-                    btn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-                    btn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+                    btn.scrollIntoView({ behavior: 'auto', block: 'center' });
+                    btn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+                    btn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+                    btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
                     btn.click();
                     return true;
                 }
                 return false;
             }""", clean)
+            if clicked:
+                return True
         except Exception:
-            return False
+            pass
+
+        try:
+            loc = page.locator(f'button:has-text("{clean}"), a:has-text("{clean}")').first
+            if await loc.count() > 0:
+                await loc.click(timeout=1500)
+                return True
+        except Exception:
+            pass
+
+        return False
 
     async def find_and_open_course(self, page, target_query: str) -> bool:
         """
@@ -1464,62 +1522,78 @@ class AutonomousByteXLAgent:
         }""")
 
     async def find_and_click_uncompleted_unit(self, page) -> Dict[str, Any]:
-        """Finds the uncompleted unit card and clicks Continue Learning / Resume."""
+        """Finds the uncompleted unit card and clicks Continue Learning / Resume or clicks the unstarted card."""
         try:
             res = await page.evaluate("""() => {
-                const allButtons = Array.from(document.querySelectorAll('button, a'));
-
-                // 1. Find exact blue button: Continue Learning, Start Learning, Resume
-                let targetBtn = allButtons.find(b => {
-                    const txt = (b.innerText || '').trim().toLowerCase();
-                    return (txt === 'continue learning' || txt === 'start learning' || txt === 'resume' || txt === 'resume my journey') && !b.disabled;
+                // Collect all unit cards
+                const cards = Array.from(document.querySelectorAll('.MuiPaper-root, .MuiCard-root, div[class*="UnitCard"], div[class*="MuiBox-root"]')).filter(c => {
+                    const t = (c.innerText || '').toLowerCase();
+                    return (t.includes('chapter') || t.includes('challenge')) && !t.includes('units and chapters') && !t.includes('how is my course graded');
                 });
 
-                // 2. Fallback: primary button not marked completed
-                if (!targetBtn) {
-                    targetBtn = Array.from(document.querySelectorAll('button.MuiButton-containedPrimary')).find(b => {
+                // 1. Look for a unit card that has an explicit action button: Continue Learning, Start Learning, Resume
+                for (const card of cards) {
+                    const btn = Array.from(card.querySelectorAll('button, a, [role="button"], div[class*="button" i]')).find(b => {
                         const txt = (b.innerText || '').trim().toLowerCase();
-                        return !txt.includes('completed');
+                        return (txt.includes('continue learning') || txt.includes('start learning') || txt.includes('resume')) && !b.disabled;
                     });
-                }
-
-                // 3. Fallback: button containing continue learning / resume
-                if (!targetBtn) {
-                    targetBtn = allButtons.find(b => {
-                        const txt = (b.innerText || '').trim().toLowerCase();
-                        return (txt.includes('continue learning') || txt.includes('start learning') || txt.includes('resume')) && !txt.includes('completed');
-                    });
-                }
-
-                if (targetBtn) {
-                    let card = targetBtn.closest('.MuiPaper-root, .MuiCard-root, .MuiBox-root, [class*="MuiButton-outlined"]') || targetBtn.parentElement;
-                    let unitTitle = 'Unit';
-                    if (card) {
+                    if (btn) {
                         const lines = card.innerText.split(/\\r?\\n/).map(l => l.trim()).filter(Boolean);
-                        const tLine = lines.find(l => !l.toLowerCase().includes('continue learning') && !l.toLowerCase().includes('start learning') && !l.toLowerCase().includes('completed') && !l.toLowerCase().includes('challenge') && !l.toLowerCase().includes('chapter'));
-                        if (tLine) unitTitle = tLine;
+                        const title = lines.find(l => !l.toLowerCase().includes('learning') && !l.toLowerCase().includes('completed') && !l.toLowerCase().includes('chapter') && !l.toLowerCase().includes('challenge')) || 'Unit';
+                        btn.scrollIntoView({ behavior: 'auto', block: 'center' });
+                        btn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+                        btn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+                        btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                        btn.click();
+                        return { clicked: true, title: title, all_completed: false };
                     }
-                    targetBtn.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                    targetBtn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-                    targetBtn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
-                    targetBtn.click();
-                    return { clicked: true, title: unitTitle };
                 }
-                return { clicked: false };
+
+                // 2. If no button found, look for an uncompleted unit card (one that DOES NOT have "Completed")
+                const uncompletedCard = cards.find(card => {
+                    const txt = (card.innerText || '').toLowerCase();
+                    return !txt.includes('completed');
+                });
+
+                if (uncompletedCard) {
+                    const lines = uncompletedCard.innerText.split(/\\r?\\n/).map(l => l.trim()).filter(Boolean);
+                    const title = lines.find(l => !l.toLowerCase().includes('completed') && !l.toLowerCase().includes('chapter') && !l.toLowerCase().includes('challenge')) || 'Unit';
+                    
+                    const clickTarget = uncompletedCard.querySelector('button, a, [role="button"], h3, h4, h5, h6, .MuiTypography-root') || uncompletedCard;
+                    clickTarget.scrollIntoView({ behavior: 'auto', block: 'center' });
+                    clickTarget.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+                    clickTarget.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+                    clickTarget.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                    clickTarget.click();
+                    return { clicked: true, title: title, all_completed: false };
+                }
+
+                // 3. Fallback: Any button or link on the page with "Continue Learning"
+                const globalBtn = Array.from(document.querySelectorAll('button, a, [role="button"]')).find(b => {
+                    const txt = (b.innerText || '').trim().toLowerCase();
+                    return (txt.includes('continue learning') || txt.includes('start learning') || txt.includes('resume')) && !b.disabled;
+                });
+                if (globalBtn) {
+                    globalBtn.scrollIntoView({ behavior: 'auto', block: 'center' });
+                    globalBtn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+                    globalBtn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+                    globalBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                    globalBtn.click();
+                    return { clicked: true, title: 'Unit', all_completed: false };
+                }
+
+                const allDone = cards.length > 0 && cards.every(c => (c.innerText || '').toLowerCase().includes('completed'));
+                return { clicked: false, all_completed: allDone };
             }""")
 
-            if res.get("clicked"):
+            if res and res.get("clicked"):
                 return res
-
-            loc = page.locator('button:has-text("Continue Learning"), a:has-text("Continue Learning")').first
-            if await loc.count() > 0 and await loc.is_visible():
-                await loc.scroll_into_view_if_needed()
-                await loc.click(timeout=3000)
-                return {"clicked": True, "title": "Unit"}
+            if res and res.get("all_completed"):
+                return res
         except Exception as e:
             self.ctrl.log(f"Unit click interaction: {e}", "warn")
 
-        return {"clicked": False}
+        return {"clicked": False, "all_completed": False}
 
     async def expand_all_accordions(self, page):
         """Expands all collapsed submodule accordions."""
@@ -1591,7 +1665,10 @@ class AutonomousByteXLAgent:
                 const target = links.find(l => (l.innerText || '').toLowerCase().includes(clean));
                 if (target) {
                     const t = target.querySelector('.MuiListItemText-root') || target;
-                    t.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    t.scrollIntoView({ behavior: 'auto', block: 'center' });
+                    t.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+                    t.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+                    t.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
                     t.click();
                     return true;
                 }
@@ -1867,7 +1944,17 @@ class AutonomousByteXLAgent:
                             await asyncio.sleep(4)
                             continue
 
-                    self.ctrl.log("🎉 All topics, quizzes, and labs in this unit are completed!", "success")
+                    self.ctrl.log("All topics in this unit complete! Navigating to Units & Chapters to continue next unit...", "info")
+                    try:
+                        m = re.match(r"(https?://[^/]+/courses/\d+/[^/]+)", active_page.url)
+                        if m:
+                            await active_page.goto(m.group(1))
+                        else:
+                            await active_page.go_back()
+                        await asyncio.sleep(3)
+                        continue
+                    except Exception:
+                        pass
                     break
 
             # 6. UNITS_LIST State ("Units and Chapters")
@@ -1879,8 +1966,13 @@ class AutonomousByteXLAgent:
                 if unit_res.get("clicked"):
                     unit_title = unit_res.get("title", "Unit")
                     self.ctrl.current_module_name = unit_title
-                    self.ctrl.log(f"🚀 Clicked 'Continue Learning' on Unit: '{unit_title}'! Loading...", "success")
+                    self.ctrl.log(f"🚀 Selected Unit: '{unit_title}'! Loading...", "success")
                     await asyncio.sleep(4)
+                    continue
+                elif unit_res.get("all_completed"):
+                    self.ctrl.log("🎉 All units on the Units & Chapters page are 100% completed!", "success")
+                    await active_page.goto("https://app.bytexl.ai/courses")
+                    await asyncio.sleep(3)
                     continue
                 else:
                     if brain.has_key():
@@ -1898,7 +1990,7 @@ class AutonomousByteXLAgent:
                                 await asyncio.sleep(4)
                                 continue
 
-                    self.ctrl.log("🎉 All units on the Units & Chapters page are completed!", "success")
+                    self.ctrl.log("No further uncompleted units detected on Units & Chapters page.", "info")
                     break
 
             # 7. COURSES_CATALOG State
