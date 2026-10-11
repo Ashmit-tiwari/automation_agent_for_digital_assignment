@@ -436,11 +436,11 @@ class AutonomousByteXLAgent:
         # If browser is currently running without remote debugging:
         # DO NOT kill it! Launch an automation profile window alongside it so the user's existing browser stays open untouched!
         if is_browser_process_running(proc_name):
-            self.ctrl.log(f"💡 {b_label} is running. Launching automation window on port {target_port} (your existing tabs remain open untouched)...", "info")
+            self.ctrl.log(f"💡 {b_label} is running without port {target_port}. Starting automation window (Tip: Use Desktop shortcut 'Brave (ByteXL Agent Ready)' to keep all your tabs & logins)...", "info")
             launch_browser_on_port(target_port, pref, use_default_profile=False)
         else:
-            self.ctrl.log(f"Launching {b_label} with remote debugging on port {target_port}...", "info")
-            launch_browser_on_port(target_port, pref, use_default_profile=False)
+            self.ctrl.log(f"Launching {b_label} with remote debugging on port {target_port} (all logins preserved)...", "info")
+            launch_browser_on_port(target_port, pref, use_default_profile=True)
 
         self.ctrl.log(f"Waiting for {b_label} on port {target_port}...", "info")
         for i in range(12):
@@ -1478,9 +1478,22 @@ class AutonomousByteXLAgent:
     async def find_and_open_course(self, page, target_query: str) -> bool:
         """
         Intelligently finds and enters the target course on the /courses catalog.
-        Uses fuzzy acronym matching ('rdms' -> 'RDBMS' -> 'Relational Database Management Systems')
-        and Gemini Brain AI resolution. Never leaves search input broken.
+        Uses fuzzy acronym matching ('RDBMS'/'rdms' -> 'Relational Database Management Systems')
+        and multi-term search query expansion. Never leaves catalog broken.
         """
+        # Wait up to 6 seconds for course cards to render on /courses
+        for _ in range(6):
+            has_cards = await page.evaluate("""() => {
+                const cards = Array.from(document.querySelectorAll('.MuiCard-root, .MuiPaper-root, .MuiBox-root')).filter(c => {
+                    const t = (c.innerText || '').toLowerCase();
+                    return t.includes('completion') || t.includes('continue learning') || t.includes('start learning') || t.includes('resume');
+                });
+                return cards.length > 0;
+            }""")
+            if has_cards:
+                break
+            await asyncio.sleep(1.0)
+
         cards_info = await page.evaluate("""() => {
             const cards = Array.from(document.querySelectorAll('.MuiCard-root, .MuiPaper-root, .MuiBox-root')).filter(c => {
                 const t = (c.innerText || '').toLowerCase();
@@ -1500,77 +1513,83 @@ class AutonomousByteXLAgent:
 
         target_clean = (target_query or "").strip()
 
-        # If user specified a target (e.g. 'RDBMS', 'rdms', 'cloud security', '900')
-        if target_clean and cards_info:
-            titles = [c["title"] for c in cards_info]
-            matched_title = brain.match_course(target_clean, titles)
+        # If user specified a target (e.g. 'RDBMS', 'rdms', 'Cloud Security', 'AZ-900')
+        if target_clean:
+            if cards_info:
+                titles = [c["title"] for c in cards_info]
+                matched_title = brain.match_course(target_clean, titles)
 
-            if matched_title:
-                self.ctrl.log(f"🎯 Smart Match: Target '{target_clean}' matched course '{matched_title}'!", "success")
-                clicked = await page.evaluate("""(matchTitle) => {
-                    const cards = Array.from(document.querySelectorAll('.MuiCard-root, .MuiPaper-root, .MuiBox-root')).filter(c => {
-                        const t = (c.innerText || '').toLowerCase();
-                        return t.includes('completion') || t.includes('continue learning') || t.includes('start learning') || t.includes('resume');
-                    });
-                    const targetCard = cards.find(c => c.innerText.includes(matchTitle));
-                    if (targetCard) {
-                        const btn = Array.from(targetCard.querySelectorAll('button, a')).find(b => {
-                            const txt = (b.innerText || '').toLowerCase();
-                            return txt.includes('continue learning') || txt.includes('start learning') || txt.includes('resume');
-                        }) || targetCard.querySelector('button, a') || targetCard;
-                        btn.click();
-                        return true;
-                    }
-                    return false;
-                }""", matched_title)
-                if clicked:
-                    return True
-
-            # If not in visible cards, try searching in search bar
-            self.ctrl.log(f"Searching catalog for: '{target_clean}'...", "info")
-            try:
-                search_input = await page.wait_for_selector('input[placeholder*="search" i]', timeout=3500)
-                if search_input:
-                    await search_input.fill("")
-                    await search_input.fill(target_clean)
-                    await page.keyboard.press("Enter")
-                    await asyncio.sleep(2.0)
-
-                    searched_cards = await page.evaluate("""() => {
+                if matched_title:
+                    self.ctrl.log(f"🎯 Smart Match: Target '{target_clean}' matched course '{matched_title}'!", "success")
+                    clicked = await page.evaluate("""(matchTitle) => {
                         const cards = Array.from(document.querySelectorAll('.MuiCard-root, .MuiPaper-root, .MuiBox-root')).filter(c => {
                             const t = (c.innerText || '').toLowerCase();
                             return t.includes('completion') || t.includes('continue learning') || t.includes('start learning') || t.includes('resume');
                         });
-                        return cards.map(c => {
-                            const titleEl = c.querySelector('h3, h4, h5, h6, .MuiTypography-h6, .MuiTypography-h5');
-                            return titleEl ? titleEl.innerText.trim() : c.innerText.split('\\n')[0].trim();
-                        });
-                    }""")
+                        const targetCard = cards.find(c => c.innerText.includes(matchTitle));
+                        if (targetCard) {
+                            const btn = Array.from(targetCard.querySelectorAll('button, a')).find(b => {
+                                const txt = (b.innerText || '').toLowerCase();
+                                return txt.includes('continue learning') || txt.includes('start learning') || txt.includes('resume');
+                            }) || targetCard.querySelector('button, a') || targetCard;
+                            btn.click();
+                            return true;
+                        }
+                        return false;
+                    }""", matched_title)
+                    if clicked:
+                        return True
 
-                    if searched_cards:
-                        matched_s = brain.match_course(target_clean, searched_cards) or searched_cards[0]
-                        self.ctrl.log(f"🎯 Found course: '{matched_s}'! Entering...", "success")
-                        clicked = await page.evaluate("""(matchTitle) => {
-                            const cards = Array.from(document.querySelectorAll('.MuiCard-root, .MuiPaper-root, .MuiBox-root'));
-                            const targetCard = cards.find(c => c.innerText.includes(matchTitle)) || cards[0];
-                            if (targetCard) {
-                                const btn = Array.from(targetCard.querySelectorAll('button, a')).find(b => {
-                                    const txt = (b.innerText || '').toLowerCase();
-                                    return txt.includes('continue learning') || txt.includes('start learning') || txt.includes('resume');
-                                }) || targetCard.querySelector('button, a') || targetCard;
-                                btn.click();
-                                return true;
-                            }
-                            return false;
-                        }""", matched_s)
-                        if clicked:
-                            return True
-                    else:
-                        # 0 cards returned by search! Clear search input immediately so catalog restores!
-                        self.ctrl.log(f"Search for '{target_clean}' yielded 0 results. Restoring full catalog...", "info")
+            # If not in visible cards, try searching catalog with expanded search terms
+            search_terms = brain.get_search_terms(target_clean)
+            if target_clean not in search_terms:
+                search_terms.insert(0, target_clean)
+
+            self.ctrl.log(f"Searching catalog for: '{target_clean}' using search terms {search_terms[:3]}...", "info")
+            try:
+                search_input = await page.wait_for_selector('input[placeholder*="search" i]', timeout=3500)
+                if search_input:
+                    for term in search_terms:
                         await search_input.fill("")
+                        await search_input.fill(term)
                         await page.keyboard.press("Enter")
-                        await asyncio.sleep(1.5)
+                        await asyncio.sleep(1.8)
+
+                        searched_cards = await page.evaluate("""() => {
+                            const cards = Array.from(document.querySelectorAll('.MuiCard-root, .MuiPaper-root, .MuiBox-root')).filter(c => {
+                                const t = (c.innerText || '').toLowerCase();
+                                return t.includes('completion') || t.includes('continue learning') || t.includes('start learning') || t.includes('resume');
+                            });
+                            return cards.map(c => {
+                                const titleEl = c.querySelector('h3, h4, h5, h6, .MuiTypography-h6, .MuiTypography-h5');
+                                return titleEl ? titleEl.innerText.trim() : c.innerText.split('\\n')[0].trim();
+                            });
+                        }""")
+
+                        if searched_cards:
+                            matched_s = brain.match_course(target_clean, searched_cards) or searched_cards[0]
+                            self.ctrl.log(f"🎯 Found course with term '{term}': '{matched_s}'! Entering...", "success")
+                            clicked = await page.evaluate("""(matchTitle) => {
+                                const cards = Array.from(document.querySelectorAll('.MuiCard-root, .MuiPaper-root, .MuiBox-root'));
+                                const targetCard = cards.find(c => c.innerText.includes(matchTitle)) || cards[0];
+                                if (targetCard) {
+                                    const btn = Array.from(targetCard.querySelectorAll('button, a')).find(b => {
+                                        const txt = (b.innerText || '').toLowerCase();
+                                        return txt.includes('continue learning') || txt.includes('start learning') || txt.includes('resume');
+                                    }) || targetCard.querySelector('button, a') || targetCard;
+                                    btn.click();
+                                    return true;
+                                }
+                                return false;
+                            }""", matched_s)
+                            if clicked:
+                                return True
+
+                    # If all search terms yielded 0, restore full catalog
+                    self.ctrl.log(f"Search for '{target_clean}' terms finished. Restoring full catalog...", "info")
+                    await search_input.fill("")
+                    await page.keyboard.press("Enter")
+                    await asyncio.sleep(1.5)
             except Exception:
                 pass
 
@@ -1611,14 +1630,31 @@ class AutonomousByteXLAgent:
     async def find_and_click_uncompleted_unit(self, page) -> Dict[str, Any]:
         """Finds the uncompleted unit card and clicks Continue Learning / Resume or clicks the unstarted card."""
         try:
-            res = await page.evaluate("""() => {
+            target_mod = (self.ctrl.target_module or "").strip()
+            res = await page.evaluate("""(targetMod) => {
                 // Collect all unit cards
                 const cards = Array.from(document.querySelectorAll('.MuiPaper-root, .MuiCard-root, div[class*="UnitCard"], div[class*="MuiBox-root"]')).filter(c => {
                     const t = (c.innerText || '').toLowerCase();
-                    return (t.includes('chapter') || t.includes('challenge')) && !t.includes('units and chapters') && !t.includes('how is my course graded');
+                    return (t.includes('chapter') || t.includes('challenge') || t.includes('unit') || t.includes('module')) &&
+                           !t.includes('units and chapters') && !t.includes('how is my course graded');
                 });
 
-                // 1. Look for a unit card that has an explicit action button: Continue Learning, Start Learning, Resume
+                // 1. If target specified, prioritize matching unit card
+                if (targetMod) {
+                    const tClean = targetMod.toLowerCase();
+                    const matchingCard = cards.find(c => (c.innerText || '').toLowerCase().includes(tClean));
+                    if (matchingCard) {
+                        const btn = Array.from(matchingCard.querySelectorAll('button, a, [role="button"], div[class*="button" i]')).find(b => {
+                            const txt = (b.innerText || '').trim().toLowerCase();
+                            return (txt.includes('continue learning') || txt.includes('start learning') || txt.includes('resume')) && !b.disabled;
+                        }) || matchingCard.querySelector('button, a, [role="button"]') || matchingCard;
+                        btn.scrollIntoView({ behavior: 'auto', block: 'center' });
+                        btn.click();
+                        return { clicked: true, title: targetMod, all_completed: false };
+                    }
+                }
+
+                // 2. Look for a unit card that has an explicit action button: Continue Learning, Start Learning, Resume
                 for (const card of cards) {
                     const btn = Array.from(card.querySelectorAll('button, a, [role="button"], div[class*="button" i]')).find(b => {
                         const txt = (b.innerText || '').trim().toLowerCase();
@@ -1636,7 +1672,7 @@ class AutonomousByteXLAgent:
                     }
                 }
 
-                // 2. If no button found, look for an uncompleted unit card (one that DOES NOT have "Completed")
+                // 3. If no button found, look for an uncompleted unit card (one that DOES NOT have "Completed")
                 const uncompletedCard = cards.find(card => {
                     const txt = (card.innerText || '').toLowerCase();
                     return !txt.includes('completed');
@@ -1655,7 +1691,7 @@ class AutonomousByteXLAgent:
                     return { clicked: true, title: title, all_completed: false };
                 }
 
-                // 3. Fallback: Any button or link on the page with "Continue Learning"
+                // 4. Fallback: Any button or link on the page with "Continue Learning"
                 const globalBtn = Array.from(document.querySelectorAll('button, a, [role="button"]')).find(b => {
                     const txt = (b.innerText || '').trim().toLowerCase();
                     return (txt.includes('continue learning') || txt.includes('start learning') || txt.includes('resume')) && !b.disabled;
@@ -1671,7 +1707,7 @@ class AutonomousByteXLAgent:
 
                 const allDone = cards.length > 0 && cards.every(c => (c.innerText || '').toLowerCase().includes('completed'));
                 return { clicked: false, all_completed: allDone };
-            }""")
+            }""", target_mod)
 
             if res and res.get("clicked"):
                 return res
@@ -1703,7 +1739,7 @@ class AutonomousByteXLAgent:
                     '.MuiAccordion-root a, .MuiAccordion-root .MuiListItem-root, .MuiAccordionDetails-root a, .MuiAccordionDetails-root .MuiListItem-root, .MuiAccordionDetails-root > div, a.MuiListItem-root, .MuiListItem-root'
                 )).filter(el => {
                     const t = (el.innerText || '').trim();
-                    return t.length > 2 && t.length < 160 && !t.toLowerCase().includes('reading materials') && !t.toLowerCase().includes('challenge');
+                    return t.length > 2 && t.length < 160 && !t.toLowerCase().includes('units and chapters') && !t.toLowerCase().includes('how is my course graded');
                 });
 
                 for (const row of candidateRows) {
@@ -1720,14 +1756,17 @@ class AutonomousByteXLAgent:
                         }
                     }
 
-                    const cb = row.querySelector('input[type="checkbox"], .MuiCheckbox-root, [data-testid*="CheckBox"], [data-testid*="Check"], span[aria-label*="complete"]');
-                    const isChecked = row.innerHTML.includes('Mui-checked') ||
-                                      row.querySelector('[data-testid="CheckBoxIcon"]') !== null ||
-                                      row.querySelector('[data-testid*="Check"]') !== null ||
-                                      row.getAttribute('aria-checked') === 'true' ||
-                                      row.classList.contains('completed') ||
-                                      row.innerText.includes('Completed') ||
-                                      (cb && (cb.checked || cb.getAttribute('aria-label') === 'Mark as incomplete'));
+                    const cb = row.querySelector('input[type="checkbox"], .MuiCheckbox-root, [data-testid*="CheckBox"], span[aria-label*="complete"]');
+                    const hasBlankIcon = row.querySelector('[data-testid="CheckBoxOutlineBlankIcon"]') !== null;
+                    const isChecked = !hasBlankIcon && (
+                        row.innerHTML.includes('Mui-checked') ||
+                        row.querySelector('[data-testid="CheckBoxIcon"]') !== null ||
+                        row.querySelector('[data-testid="CheckCircleIcon"]') !== null ||
+                        row.getAttribute('aria-checked') === 'true' ||
+                        row.classList.contains('completed') ||
+                        row.innerText.includes('Completed') ||
+                        (cb && (cb.checked || cb.getAttribute('aria-label') === 'Mark as incomplete'))
+                    );
 
                     if (!isChecked) {
                         return {
@@ -1894,6 +1933,22 @@ class AutonomousByteXLAgent:
         target_course = (self.ctrl.target_module or "").strip()
         self.ctrl.state = "Autonomous Agent Active"
         self.ctrl.log(f"🤖 Autonomous AI Assistant Active (Target: '{target_course or 'Next Uncompleted'}')", "info")
+
+        # If target course is specified, ensure we are inside it; if inside another course, navigate to catalog
+        if target_course:
+            try:
+                active_p, _ = await self.get_active_page()
+                if active_p:
+                    p_url = active_p.url
+                    p_title = await active_p.title()
+                    b_text = await active_p.evaluate("() => (document.body ? document.body.innerText : '').slice(0, 1000)")
+                    inside_target = brain.is_matching_page_course(target_course, f"{p_url} {p_title} {b_text}")
+                    if not inside_target and not p_url.rstrip("/").endswith("/courses"):
+                        self.ctrl.log(f"Navigating to course catalog to open target course '{target_course}'...", "info")
+                        await active_p.goto("https://app.bytexl.ai/courses")
+                        await asyncio.sleep(2.5)
+            except Exception:
+                pass
 
         completed_set = set()
         activities_completed = 0
@@ -2239,6 +2294,8 @@ def test_key():
 def set_target():
     data = request.json or {}
     target = (data.get("target") or "").strip()
+    if target:
+        target = brain.normalize_acronym(target)
     controller.target_module = target
     if target:
         controller.log(f"🎯 Target course set to: '{target}'. Automation will focus on this course.", "info")
@@ -2325,8 +2382,9 @@ def api_restart_browser():
     exe = find_installed_browser(req_browser)
     proc_name = os.path.basename(exe)
 
-    controller.log(f"Starting {proc_name} with remote debugging on port {port}...", "info")
-    launch_browser_on_port(port, req_browser, use_default_profile=False)
+    use_default = not is_browser_process_running(proc_name)
+    controller.log(f"Starting {proc_name} with remote debugging on port {port} (profile: {'default' if use_default else 'automation'})...", "info")
+    launch_browser_on_port(port, req_browser, use_default_profile=use_default)
     time.sleep(2)
     controller.cdp_port = port
     controller.port_error = False
@@ -2392,19 +2450,29 @@ def handle_chat():
             "reply": f"🌐 Target browser switched to <strong>{named_browser.capitalize()}</strong>.<br>Type <strong>'proceed with {named_browser} browser'</strong> to begin solving with {named_browser.capitalize()}!"
         })
 
-    # 5. Extract course target (if specified, e.g. "proceed with system design" or "proceed with brave browser for cloud security")
-    cleaned_target_candidate = msg
-    for prefix in ["proceed with", "target", "solve", "complete", "search", "use", "switch to", "open", "launch"]:
-        if cleaned_target_candidate.startswith(prefix):
-            cleaned_target_candidate = cleaned_target_candidate[len(prefix):].strip()
-            break
+    # 5. Extract course target (preserving original casing e.g. "RDBMS", "Cloud Security")
+    candidate_raw = raw_msg
+    prefix_match = re.match(
+        r'^(?:proceed\s+with|target|solve|complete|search|use|switch\s+to|open|launch)\s+(.*)',
+        candidate_raw,
+        flags=re.IGNORECASE
+    )
+    if prefix_match:
+        candidate_raw = prefix_match.group(1).strip()
 
-    # Strip browser mentions from course target candidate (e.g. "brave browser", "in brave", "on brave")
-    cleaned_target_candidate = re.sub(r'\b(in|on|with|using)?\s*(brave|chrome|edge)\s*(browser)?\b', '', cleaned_target_candidate).strip()
-    cleaned_target_candidate = re.sub(r'^(for|on|in|to)\s+', '', cleaned_target_candidate).strip()
+    candidate_raw = re.sub(
+        r'\b(?:in|on|with|using)?\s*(?:brave|chrome|edge)\s*(?:browser)?\b',
+        '',
+        candidate_raw,
+        flags=re.IGNORECASE
+    ).strip()
+    candidate_raw = re.sub(r'^(?:for|on|in|to)\s+', '', candidate_raw, flags=re.IGNORECASE).strip()
 
-    if cleaned_target_candidate and cleaned_target_candidate.lower() not in ["bytexl", "next module", "the course", "course", "browser", ""]:
-        controller.target_module = cleaned_target_candidate
+    if candidate_raw:
+        candidate_raw = brain.normalize_acronym(candidate_raw)
+
+    if candidate_raw and candidate_raw.lower() not in ["bytexl", "next module", "the course", "course", "browser", ""]:
+        controller.target_module = candidate_raw
         controller.log(f"🎯 Target course set to: '{controller.target_module}'", "info")
 
     # 6. Start / Proceed command

@@ -366,6 +366,92 @@ class GeminiBrain:
             }
 
 
+    @staticmethod
+    def normalize_acronym(text: str) -> str:
+        """Standardizes casing and expands known engineering acronyms (e.g. 'rdms'/'rdbms' -> 'RDBMS')."""
+        if not text:
+            return ""
+        clean = text.strip()
+        lower = clean.lower()
+        mapping = {
+            "rdbms": "RDBMS",
+            "rdms": "RDBMS",
+            "dbms": "DBMS",
+            "dsa": "DSA",
+            "os": "OS",
+            "cn": "CN",
+            "ai": "AI",
+            "genai": "GenAI",
+            "ml": "ML",
+            "oop": "OOP",
+            "oops": "OOPS",
+            "toc": "TOC",
+            "cd": "CD",
+            "wt": "WT",
+            "az900": "AZ-900",
+            "az-900": "AZ-900"
+        }
+        return mapping.get(lower, clean)
+
+    def get_search_terms(self, target_query: str) -> List[str]:
+        """
+        Returns a prioritized list of search terms to query ByteXL's catalog search bar.
+        For acronyms like 'RDBMS', returns both the acronym and key full-text terms
+        ('Relational Database', 'Database Management', 'SQL') so ByteXL's client-side filter succeeds.
+        """
+        if not target_query:
+            return []
+        norm = self.normalize_acronym(target_query)
+        lower = target_query.strip().lower()
+
+        ACRONYM_SEARCH = {
+            "rdbms": ["Relational Database", "Database Management", "RDBMS", "DBMS", "Database", "SQL"],
+            "rdms": ["Relational Database", "Database Management", "RDBMS", "DBMS", "Database", "SQL"],
+            "dbms": ["Database Management", "DBMS", "Database", "SQL"],
+            "dsa": ["Data Structures", "Algorithms", "DSA"],
+            "os": ["Operating Systems", "Operating System", "OS"],
+            "cn": ["Computer Networks", "Computer Networking", "CN"],
+            "ai": ["Artificial Intelligence", "AI"],
+            "genai": ["Generative AI", "Cloud Security", "GenAI"],
+            "ml": ["Machine Learning", "ML"],
+            "cloud": ["Cloud Security", "Cloud Computing"],
+            "900": ["AZ-900", "Azure", "Cloud Security"],
+            "az900": ["AZ-900", "Azure"],
+            "az-900": ["AZ-900", "Azure"],
+            "oop": ["Object Oriented", "OOP", "Java"],
+            "oops": ["Object Oriented", "OOPS", "Java"],
+            "toc": ["Theory of Computation", "Automata", "TOC"],
+            "cd": ["Compiler Design", "CD"],
+            "wt": ["Web Technologies", "Web Development", "WT"]
+        }
+
+        terms = [norm]
+        if lower in ACRONYM_SEARCH:
+            for term in ACRONYM_SEARCH[lower]:
+                if term not in terms:
+                    terms.append(term)
+        elif lower != norm.lower() and norm not in terms:
+            terms.append(norm)
+
+        return terms
+
+    def is_matching_page_course(self, target_query: str, page_text: str) -> bool:
+        """
+        Returns True if the given page URL, title, or body text matches the target course,
+        understanding acronyms (e.g. 'RDBMS' matches 'Relational Database Management').
+        """
+        if not target_query or not page_text:
+            return False
+        q_norm = self.normalize_acronym(target_query).lower()
+        text_lower = page_text.lower()
+        if q_norm in text_lower:
+            return True
+        terms = self.get_search_terms(target_query)
+        for term in terms:
+            if term.lower() in text_lower:
+                return True
+        return False
+
     def match_course(self, target_query: str, available_courses: List[str]) -> Optional[str]:
         """
         Intelligently resolves a user's course search query (including acronyms like RDBMS/rdms,

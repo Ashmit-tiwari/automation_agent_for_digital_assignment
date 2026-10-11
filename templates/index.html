@@ -954,20 +954,23 @@
                 return;
             }
             try {
-                await fetch('/api/set_target', {
+                const resp = await fetch('/api/set_target', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ target: val })
                 });
+                const resData = await resp.json();
+                const cleanTarget = resData.target || val;
+                targetInput.value = cleanTarget;
                 activeTargetBadge.style.display = 'inline-flex';
-                activeTargetText.textContent = val;
-                appendMessage('user', `proceed with ${val}`);
-                appendMessage('assistant', `🎯 Target set to: <strong>${val}</strong>.<br>The agent will search and enter this course, tick each side completion box, and solve every submodule to 100%.`);
+                activeTargetText.textContent = cleanTarget;
+                appendMessage('user', `proceed with ${cleanTarget}`);
+                appendMessage('assistant', `🎯 Target set to: <strong>${cleanTarget}</strong>.<br>The agent will search and enter this course, tick each side completion box, and solve every submodule to 100%.`);
                 // Trigger automation
                 fetch('/api/chat', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ message: `proceed with ${val}` })
+                    body: JSON.stringify({ message: `proceed with ${cleanTarget}` })
                 });
             } catch (e) {
                 alert('Error setting target: ' + e.message);
