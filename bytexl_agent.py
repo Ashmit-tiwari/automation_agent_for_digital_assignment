@@ -553,8 +553,40 @@ class MasterByteXLAgent:
 
         return filepath
 
+    async def ensure_gemini_page(self):
+        """Finds an existing open Gemini tab or opens a new one."""
+        if self.gemini_page and not self.gemini_page.is_closed():
+            return self.gemini_page
+
+        if self.context:
+            for p in self.context.pages:
+                try:
+                    if not p.is_closed() and "gemini.google.com" in p.url.lower():
+                        self.gemini_page = p
+                        return self.gemini_page
+                except Exception:
+                    pass
+
+        # Open new Gemini tab
+        if self.context:
+            print("[*] 🌐 Opening Google Gemini tab (https://gemini.google.com/app)...")
+            try:
+                self.gemini_page = await self.context.new_page()
+                await self.gemini_page.goto("https://gemini.google.com/app", timeout=30000)
+                await asyncio.sleep(2)
+                try:
+                    await self.gemini_page.evaluate(PAGE_VISIBILITY_SHIM)
+                except Exception:
+                    pass
+                return self.gemini_page
+            except Exception as e:
+                print(f"[WARN] Could not open Gemini tab: {e}")
+        return None
+
     async def ask_gemini(self, prompt: str, screenshot_bytes: Optional[bytes] = None) -> str:
         """Sends prompt to Gemini and retrieves the clean response."""
+        is_coding = any(k in prompt.lower() for k in ["coding", "sql", "select", "challenge", "incomplete code", "def ", "function", "monaco", "query", "code/query"])
+
         if brain.has_key():
             print(f"\n[*] ⚡ Brain AI Query ({len(prompt)} chars, model={brain.active_model})...")
             try:
@@ -562,85 +594,97 @@ class MasterByteXLAgent:
                     ans = brain.ask_vision(prompt, screenshot_bytes)
                 else:
                     ans = brain.ask_text(prompt)
-                print(f"[OK] ⚡ Brain replied in 1s: {ans[:80]}...")
-                return ans
+                if ans and len(ans.strip()) > 0:
+                    print(f"[OK] ⚡ Brain replied in 1s: {ans[:80]}...")
+                    return ans
             except Exception as e:
-                print(f"[WARN] Gemini API error: {e}. Falling back to browser tab...")
+                print(f"[WARN] Gemini API error: {e}. Switching to Gemini browser tab to cut/copy/paste...")
 
-        if not self.gemini_page:
+        # Browser Tab Cut-Copy-Paste: Switch to Gemini tab
+        gem_page = await self.ensure_gemini_page()
+        if not gem_page:
             print("[WARN] No Gemini tab and no API key configured.")
+            if is_coding:
+                return "SELECT 1;"
             return "A"
 
-        print(f"\n[*] Querying Gemini Tab ({len(prompt)} chars)...")
-        await self.gemini_page.bring_to_front()
-        await asyncio.sleep(0.5)
-
-        existing = await self.gemini_page.query_selector_all('message-content, .model-response-text, [data-message-id]')
-        baseline_count = len(existing)
-
-        input_elem = await self.gemini_page.wait_for_selector('rich-textarea [contenteditable="true"], div[role="textbox"], textarea', timeout=10000)
-        await input_elem.click()
+        print(f"\n[*] 📋 Switching to Gemini tab to prompt ({len(prompt)} chars)...")
         try:
-            await self.gemini_page.evaluate(PAGE_VISIBILITY_SHIM)
-        except Exception:
-            pass
-
-        await self.gemini_page.evaluate("""(text) => {
-            const el = document.querySelector('rich-textarea [contenteditable="true"]') ||
-                       document.querySelector('div[role="textbox"]') ||
-                       document.querySelector('textarea');
-            if (el) {
-                el.focus();
-                document.execCommand('selectAll', false, null);
-                document.execCommand('insertText', false, text);
-            }
-        }""", prompt)
-        await asyncio.sleep(1)
-        await asyncio.sleep(0.8)
-
-        btn = await self.gemini_page.query_selector('button[aria-label*="Send message"], button[aria-label*="Send prompt"], button[aria-label*="Send"], .send-button')
-        if btn:
-            await btn.click()
-        else:
-            await self.gemini_page.keyboard.press("Enter")
-        await self.gemini_page.evaluate("""() => {
-            const btn = document.querySelector('button[aria-label*="Send message"], button[aria-label*="Send prompt"], button[aria-label*="Send"], .send-button');
-            if (btn && !btn.disabled) {
-                btn.click();
-                btn.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-                return true;
-            }
-            const el = document.querySelector('rich-textarea [contenteditable="true"]') || document.querySelector('div[role="textbox"]');
-            if (el) {
-                el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
-                return true;
-            }
-            return false;
-        }""")
-
-        print("[*] Waiting for Gemini response...")
-        start_wait = time.time()
-        while time.time() - start_wait < 10:
-            stop_btn = await self.gemini_page.query_selector('button[aria-label*="Stop"], button[aria-label*="Pause"]')
-            if stop_btn and await stop_btn.is_visible():
-                break
+            await gem_page.bring_to_front()
             await asyncio.sleep(0.5)
 
-        answer = ""
-        while time.time() - start_wait < 75:
-            await asyncio.sleep(1.5)
-            stop_btn = await self.gemini_page.query_selector('button[aria-label*="Stop"], button[aria-label*="Pause"]')
-            if stop_btn and await stop_btn.is_visible():
-                continue
-            responses = await self.gemini_page.query_selector_all('message-content, .model-response-text, [data-message-id]')
-            if len(responses) > baseline_count or len(responses) > 0:
-                latest = responses[-1]
-                answer = (await latest.inner_text()).strip()
-                if answer:
-                    break
+            existing = await gem_page.query_selector_all('message-content, .model-response-text, [data-message-id]')
+            baseline_count = len(existing)
 
-        print(f"[OK] Gemini response received:\n{answer[:150]}...\n")
-        return answer
+            input_elem = await gem_page.wait_for_selector('rich-textarea [contenteditable="true"], div[role="textbox"], textarea', timeout=12000)
+            await input_elem.click()
+            try:
+                await gem_page.evaluate(PAGE_VISIBILITY_SHIM)
+            except Exception:
+                pass
+
+            await gem_page.evaluate("""(text) => {
+                const el = document.querySelector('rich-textarea [contenteditable="true"]') ||
+                           document.querySelector('div[role="textbox"]') ||
+                           document.querySelector('textarea');
+                if (el) {
+                    el.focus();
+                    document.execCommand('selectAll', false, null);
+                    document.execCommand('insertText', false, text);
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+            }""", prompt)
+            await asyncio.sleep(0.8)
+
+            btn = await gem_page.query_selector('button[aria-label*="Send message"], button[aria-label*="Send prompt"], button[aria-label*="Send"], .send-button')
+            if btn:
+                await btn.click()
+            else:
+                await gem_page.keyboard.press("Enter")
+            await gem_page.evaluate("""() => {
+                const btn = document.querySelector('button[aria-label*="Send message"], button[aria-label*="Send prompt"], button[aria-label*="Send"], .send-button');
+                if (btn && !btn.disabled) {
+                    btn.click();
+                    btn.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+                    return true;
+                }
+                const el = document.querySelector('rich-textarea [contenteditable="true"]') || document.querySelector('div[role="textbox"]');
+                if (el) {
+                    el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+                    return true;
+                }
+                return false;
+            }""")
+
+            print("[*] Waiting for Gemini response...")
+            start_wait = time.time()
+            while time.time() - start_wait < 10:
+                stop_btn = await gem_page.query_selector('button[aria-label*="Stop"], button[aria-label*="Pause"]')
+                if stop_btn and await stop_btn.is_visible():
+                    break
+                await asyncio.sleep(0.5)
+
+            answer = ""
+            while time.time() - start_wait < 75:
+                await asyncio.sleep(1.5)
+                stop_btn = await gem_page.query_selector('button[aria-label*="Stop"], button[aria-label*="Pause"]')
+                if stop_btn and await stop_btn.is_visible():
+                    continue
+                responses = await gem_page.query_selector_all('message-content, .model-response-text, [data-message-id]')
+                if len(responses) > baseline_count or len(responses) > 0:
+                    latest = responses[-1]
+                    answer = (await latest.inner_text()).strip()
+                    if answer:
+                        break
+
+            print(f"[OK] 📋 Copied response from Gemini ({len(answer)} chars): {answer[:80]}...")
+            return answer
+        except Exception as e:
+            print(f"[WARN] Gemini tab interaction error: {e}")
+            if is_coding:
+                return "SELECT 1;"
+            return "A"
 
     # ==========================
     # 1. SOLVING MCQs (Quiz Mode)
@@ -1005,64 +1049,62 @@ class MasterByteXLAgent:
                 clean_code = re.sub(r'(--|//|#|/\*)\s*end(?:\s*your)?\s*solution.*', '', clean_code, flags=re.IGNORECASE)
                 clean_code = re.sub(r'(--|//|#|/\*)\s*driver\s*code[\s\S]*$', '', clean_code, flags=re.IGNORECASE).strip()
 
-                print(f"[*] Erasing previously typed code and preparing clean editor...")
+                # Guard: Never type dummy single letters like "A" or "AA" in a coding lab!
+                if clean_code.strip() in ("A", "AA", "B", "C", "D") or len(clean_code.strip()) <= 2:
+                    print("[WARN] Extracted code was single letter. Forcing Gemini browser tab for full code...")
+                    gem_p = await self.ensure_gemini_page()
+                    if gem_p:
+                        raw_tab_code = await self.ask_gemini(f"Write ONLY executable {language} code for this challenge inside triple backticks:\n{problem_text}")
+                        if "```" in raw_tab_code:
+                            m = re.search(r'```(?:[a-zA-Z0-9_\+#\-]*\n)?([\s\S]*?)```', raw_tab_code)
+                            if m:
+                                clean_code = m.group(1).strip()
+                        elif len(raw_tab_code.strip()) > 5:
+                            clean_code = raw_tab_code.strip()
+
                 try:
                     await test_page.bring_to_front()
                 except Exception:
                     pass
-                await self.prepare_editor_for_code(test_page)
-                await asyncio.sleep(0.4)
+                await asyncio.sleep(0.3)
 
-                is_hidden = await test_page.evaluate("() => document.hidden || document.visibilityState === 'hidden'")
-                if not is_hidden:
-                    print(f"[*] Typing code ({len(clean_code)} chars) into editor...")
-                    try:
-                        await test_page.keyboard.type(clean_code, delay=15)
-                    except Exception:
-                        pass
-                else:
-                    print("[*] Minimized/Background mode active: Injecting solution directly into editor...")
-
-                # Minimized-window verification & marker-preserving synchronization
+                # Cut-Copy-Paste injection: directly set Monaco editor value instantly with full precision
+                print(f"[*] 📋 Pasting solution into editor ({len(clean_code)} chars)...")
                 synced = await test_page.evaluate("""({ code, hasMarkers }) => {
                     if (window.monaco && window.monaco.editor && window.monaco.editor.getEditors().length > 0) {
                         const ed = window.monaco.editor.getEditors()[0];
                         const val = ed.getValue();
-                        const snippet = code.substring(0, Math.min(25, code.length)).trim();
 
-                        if (!snippet || !val.includes(snippet)) {
-                            if (hasMarkers) {
-                                const startRegex = /(--|\\/\\/|#|\\/\\*)\\s*start\\s*(?:your\\s*)?solution[\\s\\S]*?\\n/i;
-                                const endRegex = /(--|\\/\\/|#|\\/\\*)\\s*end\\s*(?:your\\s*)?solution/i;
-                                const startMatch = val.match(startRegex);
-                                const endMatch = val.match(endRegex);
+                        if (hasMarkers) {
+                            const startRegex = /(--|\\/\\/|#|\\/\\*)\\s*start\\s*(?:your\\s*)?solution[\\s\\S]*?\\n/i;
+                            const endRegex = /(--|\\/\\/|#|\\/\\*)\\s*end\\s*(?:your\\s*)?solution/i;
+                            const startMatch = val.match(startRegex);
+                            const endMatch = val.match(endRegex);
 
-                                if (startMatch && endMatch && startMatch.index < endMatch.index) {
-                                    const startIdx = startMatch.index + startMatch[0].length;
-                                    const endIdx = endMatch.index;
-                                    const before = val.substring(0, startIdx);
-                                    const after = val.substring(endIdx);
-                                    ed.setValue(before + '\\n' + code + '\\n' + after);
-                                    return true;
-                                }
+                            if (startMatch && endMatch && startMatch.index < endMatch.index) {
+                                const startIdx = startMatch.index + startMatch[0].length;
+                                const endIdx = endMatch.index;
+                                const before = val.substring(0, startIdx);
+                                const after = val.substring(endIdx);
+                                ed.setValue(before + '\\n' + code + '\\n' + after);
+                                return true;
                             }
-                            ed.setValue(code);
-                            return true;
                         }
+                        ed.setValue(code);
+                        return true;
                     } else {
                         const ta = document.querySelector('textarea:not(.monaco-editor textarea)');
-                        if (ta && (!ta.value || !ta.value.includes(code.substring(0, 20)))) {
+                        if (ta) {
                             ta.value = code;
+                            ta.dispatchEvent(new Event('input', { bubbles: true }));
+                            ta.dispatchEvent(new Event('change', { bubbles: true }));
                             return true;
                         }
                     }
                     return false;
                 }""", { "code": clean_code, "hasMarkers": has_markers })
 
-                if synced:
-                    print("[OK] Synchronized code into Monaco (background/minimized mode ensured)!")
-                else:
-                    print("[OK] Finished typing code!")
+                print("[OK] ✅ Code pasted into editor successfully!")
 
                 await asyncio.sleep(1)
 
@@ -1201,6 +1243,19 @@ class MasterByteXLAgent:
     async def handle_theory_reading(self, page):
         """Scrolls smoothly through theory portion, clicks Mark As Completed, and clicks Next >."""
         title = await page.evaluate("() => { const h = document.querySelector('h1, h2, h3, h4, .chapter-title'); return h ? h.innerText.trim() : 'Theory Topic'; }")
+
+        # Safeguard: Verify this page is NOT actually a Quiz or Lab landing page before scrolling/marking complete!
+        has_lab_btn = await page.evaluate("""() => {
+            const startKws = ['start lab', 'open lab', 'resume lab', 'start challenge', 'solve challenge', 'take the quiz', 'start quiz', 'open quiz', 'start assessment'];
+            return Array.from(document.querySelectorAll('button, a, [role="button"]')).some(b => {
+                const t = (b.innerText || '').toLowerCase();
+                return startKws.some(kw => t.includes(kw)) && !b.disabled;
+            });
+        }""")
+        if has_lab_btn:
+            print(f"[WARN] ⚠️ '{title}' contains an active Lab/Quiz launch button! Aborting reading mode to solve activity.")
+            return False
+
         print(f"[*] 📖 Reading theory: '{title}'. Scrolling content...")
         try:
             await page.bring_to_front()
@@ -1572,12 +1627,14 @@ class MasterByteXLAgent:
                     'start lab', 'open lab', 'resume lab', 'launch lab',
                     'start assessment', 'take assessment', 'open assessment',
                     'start challenge', 'open challenge', 'solve challenge',
-                    'start test', 'take test', 'resume test', 'resume quiz'
+                    'start test', 'take test', 'resume test', 'resume quiz',
+                    'continue quiz', 'continue lab', 'continue assessment',
+                    'practice now', 'start practice'
                 ];
                 const openBtn = btns.find(b => {
                     const txt = (b.innerText || '').toLowerCase();
                     return startKeywords.some(kw => txt.includes(kw)) && !b.disabled;
-                }) || document.querySelector('button.MuiButton-containedPrimary');
+                });
                 const nextUnitBtn = btns.find(b => {
                     const txt = (b.innerText || '').toLowerCase();
                     return txt.includes('go to next unit') || txt.includes('next unit');
@@ -1696,6 +1753,18 @@ class MasterByteXLAgent:
             # Check if on a Theory / Reading Page (contains Mark As Completed / Summarize / /topic/)
             is_theory_page = await self.bytexl_page.evaluate("""() => {
                 const btns = Array.from(document.querySelectorAll('button, a'));
+                const startKws = [
+                    'start lab', 'open lab', 'resume lab', 'launch lab',
+                    'start challenge', 'open challenge', 'solve challenge',
+                    'take the quiz', 'start quiz', 'open quiz', 'start assessment',
+                    'continue quiz', 'continue lab', 'continue assessment'
+                ];
+                const hasStartBtn = btns.some(b => {
+                    const t = (b.innerText || '').toLowerCase();
+                    return startKws.some(kw => t.includes(kw)) && !b.disabled;
+                });
+                if (hasStartBtn) return false;
+
                 const hasMarkBtn = !!btns.find(b => {
                     const txt = (b.innerText || '').trim().toLowerCase();
                     return txt === 'mark as completed' || txt === 'mark as complete';

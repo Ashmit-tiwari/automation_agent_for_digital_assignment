@@ -192,7 +192,7 @@ class GeminiBrain:
             except urllib.error.HTTPError as e:
                 err_text = e.read().decode("utf-8", errors="ignore")
                 last_error = f"HTTP {e.code}: {err_text}"
-                if e.code in (404, 400) and ("not found" in err_text.lower() or "not available" in err_text.lower()):
+                if e.code in (404, 400, 429, 500, 503):
                     if not tried_discover and not models_to_try:
                         tried_discover = True
                         discovered = self._discover_models()
