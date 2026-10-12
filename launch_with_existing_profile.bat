@@ -93,9 +93,33 @@ exit /b 1
 echo Selected Browser: %BNAME% (%TARGET_EXE%)
 echo.
 
-echo [*] Launching %BNAME% with remote debugging on port %PORT%...
+:: Check if port is already active
+netstat -ano | findstr /R /C:":%PORT% .*LISTENING" >nul 2>&1
+if not errorlevel 1 (
+    echo [OK] %BNAME% is ALREADY active with Remote Debugging on port %PORT%!
+    goto :success
+)
+
+:: If browser is running without port, gracefully close so session is saved
+tasklist /fi "imagename eq %BROWSER_EXE_NAME%" 2>nul | find /i "%BROWSER_EXE_NAME%" >nul
+if not errorlevel 1 (
+    echo [*] %BNAME% is currently open without remote debugging.
+    echo [*] Gracefully closing %BNAME% so all tabs and session data are saved...
+    for /f "tokens=1 delims=." %%a in ("%BROWSER_EXE_NAME%") do (
+        powershell -Command "Get-Process %%a -ErrorAction SilentlyContinue | ForEach-Object { $_.CloseMainWindow() }" >nul 2>&1
+    )
+    timeout /t 3 >nul
+    tasklist /fi "imagename eq %BROWSER_EXE_NAME%" 2>nul | find /i "%BROWSER_EXE_NAME%" >nul
+    if not errorlevel 1 (
+        taskkill /F /IM %BROWSER_EXE_NAME% >nul 2>&1
+        timeout /t 2 >nul
+    )
+)
+
+echo [*] Starting %BNAME% with remote debugging on port %PORT%...
 start "" "%TARGET_EXE%" %FLAGS% %URLS%
 
+:success
 echo.
 echo ================================================================
 echo [OK] %BNAME% launched with remote debugging on port %PORT%!

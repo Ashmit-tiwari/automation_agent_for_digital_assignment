@@ -320,6 +320,68 @@ PAGE_VISIBILITY_SHIM = """
 })();
 """
 
+def restart_browser_with_debugging(exe_path, port, urls=None):
+    """
+    Gracefully restarts a running Chromium browser with remote debugging on the user's default profile.
+    Uses CloseMainWindow so that --restore-last-session brings back all open tabs, cookies, and active ByteXL logins.
+    """
+    if not exe_path:
+        return False
+    proc_name = os.path.basename(exe_path)
+    short_name = proc_name.replace(".exe", "")
+
+    # 1. Gracefully close main window so tabs and session are saved by Chromium
+    try:
+        subprocess.run(
+            ["powershell", "-NoProfile", "-Command", f"Get-Process {short_name} -ErrorAction SilentlyContinue | ForEach-Object {{ $_.CloseMainWindow() }}"],
+            timeout=5, capture_output=True
+        )
+        time.sleep(2)
+    except Exception:
+        pass
+
+    # 2. Terminate any stubborn background worker process
+    if is_browser_process_running(proc_name):
+        try:
+            subprocess.run(f'taskkill /F /IM {proc_name}', shell=True, capture_output=True, timeout=5)
+            time.sleep(1.5)
+        except Exception:
+            pass
+
+    # 3. Relaunch with remote debugging and session restoration
+    flags = [
+        f"--remote-debugging-port={port}",
+        "--remote-allow-origins=*",
+        "--restore-last-session",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-background-timer-throttling",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-renderer-backgrounding",
+        "--disable-features=CalculateNativeWinOcclusion,IntensiveWakeUpThrottling,ThrottleDisplayNoneAndVisibilityHiddenCrossOriginIframes,ThrottleJavascript",
+        "--run-all-compositor-stages-before-draw",
+        "--disable-ipc-flooding-protection",
+        "--disable-hang-monitor",
+    ]
+    if urls:
+        flags.extend(urls)
+    else:
+        flags.extend(["https://app.bytexl.ai/courses", "https://gemini.google.com/app"])
+
+    flag_str = " ".join(flags)
+    try:
+        os.startfile(exe_path, arguments=flag_str)
+        return True
+    except Exception:
+        pass
+    try:
+        DETACHED_FLAGS = 0x00000008 | 0x00000200
+        subprocess.Popen([exe_path] + flags, creationflags=DETACHED_FLAGS, close_fds=True)
+        return True
+    except Exception:
+        subprocess.Popen(f'start "" "{exe_path}" {flag_str}', shell=True)
+        return True
+
 def launch_browser_on_port(port, preferred=None, use_default_profile=True):
     pref = preferred or (controller.preferred_browser if 'controller' in globals() else "auto")
     exe = find_installed_browser(pref)
@@ -356,6 +418,15 @@ def launch_browser_on_port(port, preferred=None, use_default_profile=True):
     except Exception:
         subprocess.Popen(f'start "" "{exe}" {flag_str}', shell=True)
         return True
+
+# Clean up obsolete Desktop shortcut if it exists
+try:
+    _dt = os.path.join(os.environ.get("USERPROFILE", ""), "Desktop")
+    _obs_lnk = os.path.join(_dt, "Brave (ByteXL Agent Ready).lnk")
+    if os.path.exists(_obs_lnk):
+        os.remove(_obs_lnk)
+except Exception:
+    pass
 
 app = Flask(__name__, template_folder="templates")
 
@@ -428,23 +499,18 @@ class AutonomousByteXLAgent:
             self.ctrl.cdp_port = target_port
             self.ctrl.log(f"Port 9222 is in use by another browser. Using port {target_port} for {pref.capitalize()}...", "info")
 
-        # 3. Check for Desktop shortcut "Brave (ByteXL Agent Ready).lnk"
-        desktop = os.path.join(os.environ.get("USERPROFILE", ""), "Desktop")
-        brave_shortcut = os.path.join(desktop, "Brave (ByteXL Agent Ready).lnk")
+        # Directly use installed browser (Brave, Chrome, or Edge)
+        exe = find_installed_browser(pref)
+        proc_name = os.path.basename(exe) if exe else "chrome.exe"
+        b_label = proc_name.replace(".exe", "").capitalize()
 
-        if (pref == "auto" or "brave" in pref.lower()) and os.path.exists(brave_shortcut):
-            if is_browser_process_running("brave.exe"):
-                self.ctrl.log("💡 Brave is currently open. If remote debugging was not active at startup, close Brave and open it via 'Brave (ByteXL Agent Ready)'.", "info")
-            self.ctrl.log("🚀 Using Desktop shortcut: 'Brave (ByteXL Agent Ready)'...", "info")
-            try:
-                os.startfile(brave_shortcut)
-            except Exception:
-                launch_browser_on_port(target_port, "brave", use_default_profile=True)
+        # If browser process is already running without remote debugging port, gracefully restart it
+        # Chromium rejects --remote-debugging-port on a running instance unless restarted with session restore
+        if is_browser_process_running(proc_name):
+            self.ctrl.log(f"🔄 Detected {b_label} already open without remote debugging. Seamlessly enabling debugging (restoring all tabs and ByteXL session)...", "info")
+            restart_browser_with_debugging(exe, target_port)
         else:
-            exe = find_installed_browser(pref)
-            proc_name = os.path.basename(exe)
-            b_label = proc_name.replace(".exe", "").capitalize()
-            self.ctrl.log(f"Launching {b_label} with remote debugging on port {target_port} (all logins preserved)...", "info")
+            self.ctrl.log(f"🚀 Starting {b_label} with remote debugging on port {target_port} (all logins preserved)...", "info")
             launch_browser_on_port(target_port, pref, use_default_profile=True)
 
         self.ctrl.log(f"Waiting for {b_label} on port {target_port}...", "info")

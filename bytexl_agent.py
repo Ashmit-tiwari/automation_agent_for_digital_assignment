@@ -315,6 +315,68 @@ PAGE_VISIBILITY_SHIM = """
 })();
 """
 
+def restart_browser_with_debugging(exe_path, port, urls=None):
+    """
+    Gracefully restarts a running Chromium browser with remote debugging on the user's default profile.
+    Uses CloseMainWindow so that --restore-last-session brings back all open tabs, cookies, and active ByteXL logins.
+    """
+    if not exe_path:
+        return False
+    proc_name = os.path.basename(exe_path)
+    short_name = proc_name.replace(".exe", "")
+
+    # 1. Gracefully close main window so tabs and session are saved by Chromium
+    try:
+        subprocess.run(
+            ["powershell", "-NoProfile", "-Command", f"Get-Process {short_name} -ErrorAction SilentlyContinue | ForEach-Object {{ $_.CloseMainWindow() }}"],
+            timeout=5, capture_output=True
+        )
+        time.sleep(2)
+    except Exception:
+        pass
+
+    # 2. Terminate any stubborn background worker process
+    if is_browser_process_running(proc_name):
+        try:
+            subprocess.run(f'taskkill /F /IM {proc_name}', shell=True, capture_output=True, timeout=5)
+            time.sleep(1.5)
+        except Exception:
+            pass
+
+    # 3. Relaunch with remote debugging and session restoration
+    flags = [
+        f"--remote-debugging-port={port}",
+        "--remote-allow-origins=*",
+        "--restore-last-session",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-background-timer-throttling",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-renderer-backgrounding",
+        "--disable-features=CalculateNativeWinOcclusion,IntensiveWakeUpThrottling,ThrottleDisplayNoneAndVisibilityHiddenCrossOriginIframes,ThrottleJavascript",
+        "--run-all-compositor-stages-before-draw",
+        "--disable-ipc-flooding-protection",
+        "--disable-hang-monitor",
+    ]
+    if urls:
+        flags.extend(urls)
+    else:
+        flags.extend(["https://app.bytexl.ai/courses", "https://gemini.google.com/app"])
+
+    flag_str = " ".join(flags)
+    try:
+        os.startfile(exe_path, arguments=flag_str)
+        return True
+    except Exception:
+        pass
+    try:
+        DETACHED_FLAGS = 0x00000008 | 0x00000200
+        subprocess.Popen([exe_path] + flags, creationflags=DETACHED_FLAGS, close_fds=True)
+        return True
+    except Exception:
+        subprocess.Popen(f'start "" "{exe_path}" {flag_str}', shell=True)
+        return True
+
 def launch_browser_on_port(port, preferred=None, use_default_profile=True):
     exe = find_installed_browser(preferred)
     flags = [
@@ -393,19 +455,17 @@ class MasterByteXLAgent:
             self.port = free_p
             print(f"[*] Port 9222 in use by another browser. Using port {self.port} for {pref.capitalize()}...")
 
-        desktop = os.path.join(os.environ.get("USERPROFILE", ""), "Desktop")
-        brave_shortcut = os.path.join(desktop, "Brave (ByteXL Agent Ready).lnk")
+        exe = find_installed_browser(pref)
+        proc_name = os.path.basename(exe) if exe else "chrome.exe"
+        b_label = proc_name.replace(".exe", "").capitalize()
 
-        if (pref == "auto" or "brave" in pref.lower()) and os.path.exists(brave_shortcut):
-            print("[*] 🚀 Using Desktop shortcut: 'Brave (ByteXL Agent Ready)'...")
-            try:
-                os.startfile(brave_shortcut)
-            except Exception:
-                launch_browser_on_port(self.port, "brave", use_default_profile=True)
+        # If browser process is already running without remote debugging port, gracefully restart it
+        # Chromium rejects --remote-debugging-port on a running instance unless restarted with session restore
+        if is_browser_process_running(proc_name):
+            print(f"[*] 🔄 Detected {b_label} already running without remote debugging.")
+            print(f"[*] Seamlessly enabling remote debugging on port {self.port} (restoring all tabs and ByteXL session)...")
+            restart_browser_with_debugging(exe, self.port)
         else:
-            exe = find_installed_browser(pref)
-            proc_name = os.path.basename(exe)
-            b_label = proc_name.replace(".exe", "").capitalize()
             print(f"[*] Launching {b_label} browser with remote debugging on port {self.port} (all logins preserved)...")
             launch_browser_on_port(self.port, pref, use_default_profile=True)
 

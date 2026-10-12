@@ -17,8 +17,6 @@ INCLUDE_FILES = [
     "launch_with_existing_profile.bat",
     "launch_existing_brave.bat",
     "start_brave_for_agent.bat",
-    "create_desktop_shortcut.py",
-    "create_desktop_shortcut.bat",
 ]
 
 INCLUDE_DIRS = [
