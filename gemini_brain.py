@@ -14,11 +14,11 @@ from typing import Optional, Dict, Any, List
 
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 DEFAULT_MODELS = [
+    "gemini-flash-lite-latest",
+    "gemini-1.5-flash",
     "gemini-flash-latest",
     "gemini-3.8-flash",
-    "gemini-flash-lite-latest",
-    "gemini-2.5-flash",
-    "gemini-1.5-flash"
+    "gemini-2.5-flash"
 ]
 
 
@@ -140,7 +140,7 @@ class GeminiBrain:
                         return {"success": True, "model": model, "response": text}
             except urllib.error.HTTPError as e:
                 err_body = e.read().decode("utf-8", errors="ignore")
-                if e.code == 404:
+                if e.code in (400, 404, 429, 500, 503):
                     if not tried_discover and not models_to_test:
                         tried_discover = True
                         discovered = self._discover_models()

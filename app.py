@@ -954,6 +954,7 @@ class AutonomousByteXLAgent:
             }""")
             await asyncio.sleep(1.5)
         self.ctrl.log("MCQ Quiz finished and tab closed.", "success")
+        return q_num > 0
 
     async def prepare_editor_for_code(self, test_page):
         """
@@ -1005,8 +1006,157 @@ class AutonomousByteXLAgent:
             }
         }""")
 
-    async def solve_coding(self, test_page):
-        self.ctrl.log("Starting Coding / SQL Lab challenge with typed keystrokes...", "info")
+    async def handle_start_confirmation_dialog(self, page) -> bool:
+        """Clicks any confirmation modal dialog that appears after clicking Start Lab / Take Quiz."""
+        try:
+            for _ in range(4):
+                clicked = await page.evaluate("""() => {
+                    const dialogs = Array.from(document.querySelectorAll('.MuiDialog-root, .MuiModal-root, [role="dialog"], .modal'));
+                    for (const d of dialogs) {
+                        const cb = d.querySelector('input[type="checkbox"]');
+                        if (cb && !cb.checked) {
+                            cb.click();
+                        }
+                        const btns = Array.from(d.querySelectorAll('button, a, [role="button"]')).filter(b => {
+                            const t = (b.innerText || '').toLowerCase();
+                            return (t.includes('start') || t.includes('confirm') || t.includes('proceed') ||
+                                    t.includes('yes') || t.includes('begin') || t.includes('agree') ||
+                                    t.includes('continue') || t.includes('launch')) && !b.disabled;
+                        });
+                        if (btns.length > 0) {
+                            btns[btns.length - 1].click();
+                            return true;
+                        }
+                    }
+                    return false;
+                }""")
+                if clicked:
+                    return True
+                await asyncio.sleep(0.5)
+        except Exception:
+            pass
+        return False
+
+    async def evaluate_lab_test_cases(self, test_page) -> Dict[str, Any]:
+        """
+        AI Evaluation Engine: Inspects ByteXL Test Cases results table,
+        status badges, terminal console, and summary metrics.
+        Returns:
+            {
+                'evaluated': bool,
+                'all_passed': bool,
+                'passed_count': int,
+                'failed_count': int,
+                'total_count': int,
+                'details': str
+            }
+        """
+        try:
+            return await test_page.evaluate("""() => {
+                const bodyText = (document.body ? document.body.innerText : '');
+                const bodyLower = bodyText.toLowerCase();
+
+                // 1. Check table rows for individual test cases
+                const rows = Array.from(document.querySelectorAll('tr, .MuiTableRow-root, div[class*="test-case" i], div[class*="testcase" i]'));
+                let passedCount = 0;
+                let failedCount = 0;
+                let failedDetails = [];
+
+                for (const r of rows) {
+                    const txt = (r.innerText || '').trim();
+                    const lower = txt.toLowerCase();
+                    if (lower.includes('test case') || lower.includes('testcase')) {
+                        if (lower.includes('passed') && !lower.includes('failed') && !lower.includes('wrong')) {
+                            passedCount++;
+                        } else if (lower.includes('failed') || lower.includes('wrong answer') || lower.includes('error')) {
+                            failedCount++;
+                            failedDetails.push(txt.replace(/\\s+/g, ' '));
+                        }
+                    }
+                }
+
+                // 2. Check test result badges / chips (.MuiChip-root, .status)
+                const chips = Array.from(document.querySelectorAll('.MuiChip-root, [class*="status" i], [class*="badge" i]'));
+                for (const c of chips) {
+                    const t = (c.innerText || '').toLowerCase();
+                    if (t.includes('passed') && !t.includes('failed')) passedCount = Math.max(passedCount, 1);
+                    if (t.includes('failed') || t.includes('wrong answer')) failedCount = Math.max(failedCount, 1);
+                }
+
+                // 3. Check output console / terminal logs
+                const consoleEl = document.querySelector('.test-results, .output-console, .console, .terminal, pre, code');
+                const consoleText = consoleEl ? consoleEl.innerText.trim() : '';
+
+                // 4. Fraction detection: e.g. 'Passed 3/3' or '3 / 3 test cases passed'
+                const fracMatch = bodyText.match(/(?:passed\\s*:?\\s*)?(\\d+)\\s*\\/\\s*(\\d+)(?:\\s*test\\s*cases?\\s*passed)?/i);
+                if (fracMatch) {
+                    const p = parseInt(fracMatch[1]);
+                    const tot = parseInt(fracMatch[2]);
+                    if (tot > 0 && p === tot) {
+                        return {
+                            evaluated: true,
+                            all_passed: true,
+                            passed_count: p,
+                            failed_count: 0,
+                            total_count: tot,
+                            details: 'All test cases passed (' + p + '/' + tot + ')'
+                        };
+                    }
+                }
+
+                const textHasFailed = bodyLower.includes('failed') || bodyLower.includes('wrong answer') ||
+                                      bodyLower.includes('compilation error') || bodyLower.includes('syntax error');
+                const textHasPassed = bodyLower.includes('passed') || bodyLower.includes('all test cases passed') ||
+                                      bodyLower.includes('submission accepted') || bodyLower.includes('correct answer');
+
+                const total = passedCount + failedCount;
+                const allPassed = (passedCount > 0 && failedCount === 0) || (textHasPassed && !textHasFailed && !failedCount);
+
+                return {
+                    evaluated: total > 0 || textHasPassed || textHasFailed,
+                    all_passed: allPassed,
+                    passed_count: passedCount,
+                    failed_count: failedCount,
+                    total_count: total > 0 ? total : (allPassed ? 1 : 0),
+                    details: failedDetails.join(' | ') || consoleText.slice(0, 500) || (allPassed ? 'Passed' : 'Pending/Failed')
+                };
+            }""")
+        except Exception as e:
+            return {'evaluated': False, 'all_passed': False, 'passed_count': 0, 'failed_count': 1, 'total_count': 1, 'details': str(e)}
+
+    async def request_clean_code_from_gemini(self, problem_text: str, language: str, starter_code: str = "") -> str:
+        """Reliably generates executable solution code from Gemini, with zero option letters allowed."""
+        prompt = (
+            f"You are an expert programmer writing {language} code for this challenge:\n\n"
+            f"Problem Statement:\n{problem_text}\n\n"
+        )
+        if starter_code:
+            prompt += f"Starter Code:\n```{language}\n{starter_code}\n```\n\n"
+        prompt += (
+            f"REQUIREMENTS:\n"
+            f"- Output ONLY valid, executable {language} code inside triple backticks.\n"
+            f"- DO NOT output single letters like A, B, C, D.\n"
+            f"- DO NOT output explanations, introductory text, or markdown outside backticks."
+        )
+
+        resp = await self.ask_gemini(prompt)
+        clean = resp
+        if "```" in resp:
+            m = re.search(r'```(?:[a-zA-Z0-9_\+#\-]*\n)?([\s\S]*?)```', resp)
+            if m:
+                clean = m.group(1).strip()
+        lines = clean.split("\n")
+        if lines and lines[0].strip().lower() in ['sql', 'postgresql', 'postgres', 'python', 'python3', 'java', 'cpp']:
+            clean = "\n".join(lines[1:]).strip()
+
+        # Clean markers
+        clean = re.sub(r'(--|//|#|/\*)\s*start(?:\s*your)?\s*solution.*?\n', '', clean, flags=re.IGNORECASE)
+        clean = re.sub(r'(--|//|#|/\*)\s*end(?:\s*your)?\s*solution.*', '', clean, flags=re.IGNORECASE)
+        clean = re.sub(r'(--|//|#|/\*)\s*driver\s*code[\s\S]*$', '', clean, flags=re.IGNORECASE).strip()
+        return clean
+
+    async def solve_coding(self, test_page) -> bool:
+        self.ctrl.log("🔬 Evaluating and Solving Coding / SQL Lab Challenge...", "info")
         await test_page.bring_to_front()
 
         total_questions = await test_page.evaluate("""() => {
@@ -1016,13 +1166,15 @@ class AutonomousByteXLAgent:
             });
             return els.length > 0 ? els.length : 1;
         }""")
-        self.ctrl.log(f"Lab contains {total_questions} challenges.", "info")
+        self.ctrl.log(f"Lab contains {total_questions} challenges to evaluate & solve.", "info")
+
+        all_lab_passed = True
 
         for q_idx in range(1, total_questions + 1):
             if self.ctrl.stop_requested:
-                break
+                return False
 
-            self.ctrl.log(f"Lab Challenge {q_idx}/{total_questions}", "info")
+            self.ctrl.log(f"📋 Lab Challenge {q_idx}/{total_questions}", "info")
 
             await test_page.evaluate("""(num) => {
                 const items = Array.from(document.querySelectorAll('h6, p, button, div')).filter(el => {
@@ -1061,37 +1213,40 @@ class AutonomousByteXLAgent:
                 re.search(r'(--|//|#|/\*)\s*end\s*(?:your\s*)?solution', initial_starter_code, re.IGNORECASE)
             )
 
-            # Prepare prompt with incomplete code included as requested
+            current_prompt = ""
             if has_markers:
-                prompt = (
+                current_prompt = (
                     f"Solve the following {language} coding / SQL challenge.\n\n"
                     f"Problem Statement:\n{problem_text}\n\n"
                     f"Incomplete Code from Editor:\n```{language}\n{initial_starter_code}\n```\n\n"
                     f"INSTRUCTIONS:\n"
                     f"- Write ONLY the code/query that goes strictly between the start and end solution markers.\n"
-                    f"- Do NOT repeat the marker lines ('-- start your solution', '-- end your solution') or Driver Code in your response.\n"
+                    f"- Do NOT repeat the marker lines or Driver Code in your response.\n"
                     f"- Return ONLY the executable query or code inside triple backticks with no commentary."
                 )
             else:
-                prompt = (
+                current_prompt = (
                     f"Solve the following coding / SQL challenge in {language}.\n"
                     f"Return ONLY the executable query or code inside triple backticks with no introductory or concluding text.\n\n"
                     f"Problem Statement:\n{problem_text}"
                 )
                 if initial_starter_code.strip():
-                    prompt += f"\n\nIncomplete / Starter Code in Editor:\n```{language}\n{initial_starter_code}\n```\n"
+                    current_prompt += f"\n\nIncomplete / Starter Code in Editor:\n```{language}\n{initial_starter_code}\n```\n"
 
-            for attempt in range(1, 4):
+            question_passed = False
+
+            for attempt in range(1, 5):
                 if attempt > 1:
-                    self.ctrl.log(f"Attempt {attempt}/3: Re-checking solution with Gemini...", "warn")
+                    self.ctrl.log(f"Attempt {attempt}/4: AI Self-Correction loop with error feedback...", "warn")
                 else:
-                    self.ctrl.log(f"Attempt {attempt}/3: Querying Gemini for solution...", "info")
+                    self.ctrl.log(f"Attempt {attempt}/4: Querying Gemini for optimal solution...", "info")
 
                 try:
                     shot_bytes = await test_page.screenshot(type="jpeg", quality=85)
                 except Exception:
                     shot_bytes = None
-                answer = await self.ask_gemini(prompt, screenshot_bytes=shot_bytes)
+
+                answer = await self.ask_gemini(current_prompt, screenshot_bytes=shot_bytes)
 
                 clean_code = answer
                 if "```" in answer:
@@ -1108,18 +1263,15 @@ class AutonomousByteXLAgent:
                 clean_code = re.sub(r'(--|//|#|/\*)\s*end(?:\s*your)?\s*solution.*', '', clean_code, flags=re.IGNORECASE)
                 clean_code = re.sub(r'(--|//|#|/\*)\s*driver\s*code[\s\S]*$', '', clean_code, flags=re.IGNORECASE).strip()
 
-                # Guard: Never type dummy single letters like "A" or "AA" in a coding lab!
-                if clean_code.strip() in ("A", "AA", "B", "C", "D") or len(clean_code.strip()) <= 2:
-                    self.ctrl.log("⚠️ Extracted code was single letter. Forcing Gemini browser tab for full code...", "warn")
-                    gem_p = await self.ensure_gemini_page()
-                    if gem_p:
-                        raw_tab_code = await self.ask_gemini(f"Write ONLY executable {language} code for this challenge inside triple backticks:\n{problem_text}")
-                        if "```" in raw_tab_code:
-                            m = re.search(r'```(?:[a-zA-Z0-9_\+#\-]*\n)?([\s\S]*?)```', raw_tab_code)
-                            if m:
-                                clean_code = m.group(1).strip()
-                        elif len(raw_tab_code.strip()) > 5:
-                            clean_code = raw_tab_code.strip()
+                # ANTI-DUMMY CODE GUARD: Never inject dummy letters ("A", "AA", etc.) into code editor
+                if not clean_code or clean_code.strip() in ("A", "AA", "B", "C", "D") or len(clean_code.strip()) <= 3:
+                    self.ctrl.log("⚠️ Extracted code was invalid/single-letter. Requesting clean executable code...", "warn")
+                    clean_code = await self.request_clean_code_from_gemini(problem_text, language, initial_starter_code)
+
+                # Final guard: if still invalid, skip to avoid destroying the editor
+                if not clean_code or clean_code.strip() in ("A", "AA", "B", "C", "D") or len(clean_code.strip()) <= 3:
+                    self.ctrl.log("⚠️ Could not obtain valid code from Gemini this attempt. Retrying...", "warn")
+                    continue
 
                 try:
                     await test_page.bring_to_front()
@@ -1128,7 +1280,7 @@ class AutonomousByteXLAgent:
                 await asyncio.sleep(0.3)
 
                 # Cut-Copy-Paste injection: directly set Monaco editor value instantly with full precision
-                self.ctrl.log(f"📋 Pasting solution into editor ({len(clean_code)} chars)...", "info")
+                self.ctrl.log(f"📋 Injecting verified solution into editor ({len(clean_code)} chars)...", "info")
                 synced = await test_page.evaluate("""({ code, hasMarkers }) => {
                     if (window.monaco && window.monaco.editor && window.monaco.editor.getEditors().length > 0) {
                         const ed = window.monaco.editor.getEditors()[0];
@@ -1163,7 +1315,7 @@ class AutonomousByteXLAgent:
                     return false;
                 }""", { "code": clean_code, "hasMarkers": has_markers })
 
-                self.ctrl.log("✅ Code pasted into editor successfully!", "success")
+                self.ctrl.log("✅ Code injected into editor. Submitting for evaluation...", "info")
 
                 await asyncio.sleep(1)
                 await test_page.evaluate("""() => {
@@ -1176,46 +1328,50 @@ class AutonomousByteXLAgent:
                         btn.dispatchEvent(new MouseEvent('click', { bubbles: true }));
                     }
                 }""")
-                self.ctrl.log("Submitted code. Waiting for test results...", "info")
 
-                await asyncio.sleep(6)
+                # Poll and evaluate test case execution
+                await asyncio.sleep(5)
+                eval_res = None
+                for _ in range(5):
+                    eval_res = await self.evaluate_lab_test_cases(test_page)
+                    if eval_res.get('evaluated'):
+                        break
+                    await asyncio.sleep(1.0)
+
                 await self.take_screenshot(f"lab_q{q_idx}_attempt{attempt}")
 
-                test_status = await test_page.evaluate("""() => {
-                    const text = document.body.innerText;
-                    const passed = text.includes("Passed") && !text.includes("Failed") && !text.includes("Wrong Answer") && !text.includes("Error");
-                    const errorBox = document.querySelector('.test-results, .output-console, .console, .terminal');
-                    return {
-                        passed: passed,
-                        details: errorBox ? errorBox.innerText.substring(0, 1000) : text.substring(0, 1000)
-                    };
-                }""")
-
-                if test_status.get("passed"):
-                    self.ctrl.log(f"Challenge {q_idx} PASSED!", "success")
+                if eval_res and eval_res.get("all_passed"):
+                    self.ctrl.log(f"🎉 Evaluation PASSED: Challenge {q_idx} passed all test cases ({eval_res['passed_count']}/{eval_res['total_count']})!", "success")
+                    question_passed = True
                     break
                 else:
-                    self.ctrl.log(f"Attempt {attempt} failed. Re-prompting Gemini with error...", "warn")
+                    fail_info = eval_res.get('details', 'Test cases failed') if eval_res else 'Execution failed'
+                    self.ctrl.log(f"❌ Evaluation FAILED (Attempt {attempt}/4): {fail_info[:120]}. Self-correcting...", "warn")
+                    # Construct self-correcting prompt with precise error feedback
                     if has_markers:
-                        prompt = (
+                        current_prompt = (
                             f"The previous solution in {language} failed test cases.\n\n"
                             f"Problem Statement:\n{problem_text}\n\n"
                             f"Incomplete Code from Editor:\n```{language}\n{initial_starter_code}\n```\n\n"
                             f"Previous Code Typed:\n```{language}\n{clean_code}\n```\n\n"
-                            f"Error Details:\n{test_status.get('details', '')}\n\n"
+                            f"Test Failure Details:\n{fail_info}\n\n"
                             f"Fix the error. Return ONLY the corrected code to place between the start and end solution markers inside triple backticks with no commentary."
                         )
                     else:
-                        prompt = (
+                        current_prompt = (
                             f"The previous solution in {language} failed test cases.\n\n"
                             f"Problem:\n{problem_text}\n\n"
                             f"Previous Code:\n```{language}\n{clean_code}\n```\n\n"
-                            f"Error Details:\n{test_status.get('details', '')}\n\n"
+                            f"Test Failure Details:\n{fail_info}\n\n"
                             f"Fix it. Return ONLY the corrected code inside triple backticks with no commentary."
                         )
 
+            if not question_passed:
+                all_lab_passed = False
+                self.ctrl.log(f"⚠️ Challenge {q_idx} could not pass all test cases after 4 attempts.", "warn")
+
         # Check for overarching Submit / Finish button on last challenge
-        self.ctrl.log("Finished challenges. Checking for Submit/Finish...", "info")
+        self.ctrl.log("Finished all challenges. Checking for Submit/Finish...", "info")
         await test_page.evaluate("""() => {
             const buttons = Array.from(document.querySelectorAll('button, a'));
             const finish = buttons.find(b => {
@@ -1236,8 +1392,7 @@ class AutonomousByteXLAgent:
         }""")
         await asyncio.sleep(2)
 
-        # Cut (close) the lab tabs if opened separately
-        self.ctrl.log("Cutting lab tab and moving to next topic...", "info")
+        # Close the lab tab if separate
         TEST_CLOSE_KEYS = ['/test/', '/assessment/', '/quiz/', '/lab/', '/challenge/', '/compiler/', '/practice/']
         for p in list(self.context.pages):
             try:
@@ -1254,13 +1409,7 @@ class AutonomousByteXLAgent:
                 pass
             await asyncio.sleep(1.5)
 
-            # Advance if on landing page
-            await self.bytexl_page.evaluate("""() => {
-                const btn = Array.from(document.querySelectorAll('button, a')).find(b => (b.innerText || '').toLowerCase().includes('next unit'));
-                if (btn) btn.click();
-            }""")
-            await asyncio.sleep(1.5)
-        self.ctrl.log("Coding Lab completed and tab closed.", "success")
+        return all_lab_passed
 
     async def handle_theory_reading(self, page):
         """Scrolls smoothly through theory portion, clicks Mark As Completed, and clicks Next >."""
@@ -1884,6 +2033,12 @@ class AutonomousByteXLAgent:
 
                     if (doneList.some(d => titleLine.includes(d) || (d && d.includes(titleLine)))) continue;
 
+                    const lowerTitle = titleLine.toLowerCase();
+                    const isActivity = lowerTitle.includes('challenge') || lowerTitle.includes('lab') ||
+                                       lowerTitle.includes('quiz') || lowerTitle.includes('assessment') ||
+                                       lowerTitle.includes('practice');
+
+                    let submoduleIncomplete = false;
                     const accordion = row.closest('.MuiAccordion-root');
                     if (accordion) {
                         const accSummary = accordion.querySelector('.MuiAccordionSummary-root');
@@ -1891,13 +2046,13 @@ class AutonomousByteXLAgent:
                             const st = (accSummary.innerText || '').toLowerCase();
                             const frac = st.match(/(\\d+)\\s*(?:\\/|of)\\s*(\\d+)\\s*completed/);
                             if (frac && parseInt(frac[1]) < parseInt(frac[2])) {
-                                // Submodule has uncompleted items (e.g. 0/3 or 1/3) -> Do not skip!
+                                submoduleIncomplete = true;
                             } else if (frac && parseInt(frac[1]) === parseInt(frac[2]) && parseInt(frac[2]) > 0) {
                                 continue;
                             }
                             const pct = st.match(/(\\d+)%\\s*completed/);
                             if (pct && parseInt(pct[1]) < 100) {
-                                // Submodule is partially complete -> Do not skip!
+                                submoduleIncomplete = true;
                             } else if (pct && parseInt(pct[1]) === 100) {
                                 continue;
                             }
@@ -1921,7 +2076,8 @@ class AutonomousByteXLAgent:
                         (cb && (cb.checked || cb.getAttribute('aria-label') === 'Mark as incomplete'))
                     );
 
-                    if (!isChecked) {
+                    // If not checked, OR if submodule is incomplete and this is an activity (re-verifying pending labs/quizzes)
+                    if (!isChecked || (submoduleIncomplete && isActivity)) {
                         return {
                             text: titleLine,
                             href: row.href || (row.querySelector('a') ? row.querySelector('a').href : null)
@@ -2208,14 +2364,32 @@ class AutonomousByteXLAgent:
                 except Exception:
                     pass
 
-                if state_info.get("isCoding"):
-                    await self.solve_coding(active_page)
-                else:
-                    await self.solve_mcq(active_page)
+                # Environment Settle Wait: Wait up to 6 seconds for Monaco editor or MCQ radios to mount
+                is_coding = state_info.get("isCoding", False)
+                if not is_coding:
+                    for _ in range(8):
+                        has_monaco = await active_page.evaluate("() => !!document.querySelector('.monaco-editor, textarea#code, .editor, .language-selector')")
+                        if has_monaco:
+                            is_coding = True
+                            break
+                        has_radios = await active_page.evaluate("() => !!document.querySelector('[role=\"radiogroup\"], .MuiRadioGroup-root, input[type=\"radio\"]')")
+                        if has_radios:
+                            is_coding = False
+                            break
+                        await asyncio.sleep(0.5)
 
-                if current_activity_name:
-                    completed_set.add(current_activity_name)
-                activities_completed += 1
+                if is_coding:
+                    eval_passed = await self.solve_coding(active_page)
+                else:
+                    eval_passed = await self.solve_mcq(active_page)
+
+                if eval_passed:
+                    self.ctrl.log(f"🏆 Assessment '{current_activity_name or 'Activity'}' EVALUATED & VERIFIED PASSED!", "success")
+                    if current_activity_name:
+                        completed_set.add(current_activity_name)
+                    activities_completed += 1
+                else:
+                    self.ctrl.log(f"⚠️ Assessment '{current_activity_name or 'Activity'}' did NOT pass all requirements. Leaving unticked for retry.", "warn")
 
                 # If test ran in a separate tab, close it now so agent doesn't get stuck on it
                 if is_separate_tab and not active_page.is_closed():
@@ -2247,7 +2421,8 @@ class AutonomousByteXLAgent:
 
                 await asyncio.sleep(2)
 
-                if main_course_page and current_activity_name:
+                # ONLY tick completion checkbox IF evaluated & passed!
+                if eval_passed and main_course_page and current_activity_name:
                     ticked = await self.tick_completion_checkbox(main_course_page, current_activity_name)
                     if ticked:
                         self.ctrl.log(f"✅ Ticked completion box for '{current_activity_name}'!", "success")
@@ -2281,6 +2456,10 @@ class AutonomousByteXLAgent:
                 self.ctrl.log(f"Launching Activity: '{btn_text}'...", "info")
                 pages_before = set(self.context.pages)
                 await self.click_button_reliably(active_page, btn_text)
+
+                # Handle any pre-start confirmation modal / dialog immediately
+                await asyncio.sleep(1.0)
+                await self.handle_start_confirmation_dialog(active_page)
 
                 # Auto-detect newly opened assessment tab and bring to front immediately
                 new_test_tab = None
